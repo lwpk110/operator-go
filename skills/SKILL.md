@@ -106,5 +106,5 @@ metadata:
 
 - 不要绕过 operator-go 核心抽象自行拼装主流程
 - 不要在 controller 层直接写资源构建细节
-- 不要忽略 `GenericClusterSpec.ClusterOperation`（类型为 `ClusterOperationSpec`，如 `ReconciliationPaused`、`Stopped`）语义
+- 不要忽略 `GenericClusterSpec.ClusterOperation`（如 `ReconciliationPaused`、`Stopped`）语义
 - 不要只做 happy path，缺少错误与状态回归验证
