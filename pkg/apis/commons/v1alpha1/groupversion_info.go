@@ -1,5 +1,5 @@
 /*
-Copyright 2024 zncdatadev.
+Copyright 2024 ZNCDataDev.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 // Package v1alpha1 contains API Schema definitions for the v1alpha1 API group
 // +kubebuilder:object:generate=true
-// +groupName=zncdata.dev
+// +groupName=kubedoop.dev
 package v1alpha1
 
 import (
@@ -26,7 +26,7 @@ import (
 
 var (
 	// GroupVersion is group version used to register these objects
-	GroupVersion = schema.GroupVersion{Group: "zncdata.dev", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "kubedoop.dev", Version: "v1alpha1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionKind scheme
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

@@ -1,5 +1,5 @@
 ### VisualStudioCode template
-.vscode/*
+.vscode
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
@@ -186,3 +186,17 @@ Temporary Items
 
 bin/
 testbin/
+
+# test
+ginkgo.report
+cover.out
+*__debug*
+**/coverage
+
+# ai coding
+.codiumai.toml
+.auto-claude/
+_bmad*
+.omc
+.claude/worktrees
+.serena

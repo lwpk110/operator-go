@@ -1,5 +1,5 @@
 /*
-Copyright 2024 zncdatadev.
+Copyright 2024 ZNCDataDev.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,84 +18,66 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 )
 
-// DatabaseSpec defines the desired connection info of Database
-type DatabaseSpec struct {
+// DatabaseDriver represents the type of database.
+// +kubebuilder:validation:Enum=mysql;postgres;mariadb
+type DatabaseDriver string
 
-	//+kubebuilder:validation:Required
-	DatabaseName string `json:"databaseName,omitempty"`
+const (
+	// DatabaseDriverMySQL represents MySQL database driver.
+	DatabaseDriverMySQL DatabaseDriver = "mysql"
+	// DatabaseDriverPostgres represents PostgreSQL database driver.
+	DatabaseDriverPostgres DatabaseDriver = "postgres"
+	// DatabaseDriverMariaDB represents MariaDB database driver.
+	DatabaseDriverMariaDB DatabaseDriver = "mariadb"
+)
 
-	// Name of DatabaseConnection CR to use for this database.
-	//+kubebuilder:validation:Required
-	Reference string `json:"reference,omitempty"`
-
-	// Credential is the credential for the database.
-	// It contains Username and Password, or ExistSecret.
-	//+kubebuilder:validation:Required
-	Credential *DatabaseCredentialSpec `json:"credential,omitempty"`
-}
-
-type DatabaseStatus struct {
-	// +kubebuilder:validation:Optional
-	Conditions []metav1.Condition `json:"condition,omitempty"`
-}
-
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
-
-// Database is the Schema for the databases API
-type Database struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-
-	Spec   DatabaseSpec   `json:"spec,omitempty"`
-	Status DatabaseStatus `json:"status,omitempty"`
-}
-
-//+kubebuilder:object:root=true
-
-// DatabaseList contains a list of Database
-type DatabaseList struct {
-	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []Database `json:"items"`
-}
-
-// DatabaseConnectionSpec defines the desired state of DatabaseConnection
+// DatabaseConnectionSpec defines the database connection configuration.
 type DatabaseConnectionSpec struct {
+	// Host is the database server hostname.
 	// +kubebuilder:validation:Required
-	Provider *DatabaseConnectionProvider `json:"provider,omitempty"`
+	Host string `json:"host,omitempty"`
 
+	// Port is the database server port.
 	// +kubebuilder:validation:Optional
-	Default bool `json:"default,omitempty"`
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
+	Port int `json:"port,omitempty"`
+
+	// Driver is the database driver type (mysql, postgres, mariadb).
+	// +kubebuilder:validation:Required
+	Driver DatabaseDriver `json:"driver,omitempty"`
+
+	// Database is the database name.
+	// +kubebuilder:validation:Optional
+	Database string `json:"database,omitempty"`
+
+	// Credentials references the secret containing authentication credentials.
+	// +kubebuilder:validation:Required
+	Credentials *commonsv1alpha1.Credentials `json:"credentials,omitempty"`
+
+	// TLS configuration for secure connections.
+	// +kubebuilder:validation:Optional
+	TLS *TLS `json:"tls,omitempty"`
 }
 
-// DatabaseCredentialSpec include: Username and Password or ExistSecret.
-type DatabaseCredentialSpec struct {
-	// ExistSecret is a Secret name, created by user.
-	// It includes Username and Password, it is encrypted by base64.
-	// If ExistSecret is not empty, Username and Password will be ignored.
+// TLS defines the TLS configuration for database connections.
+type TLS struct {
 	// +kubebuilder:validation:Optional
-	ExistSecret string `json:"existingSecret,omitempty"`
-
-	// Username is the username for the database.
-	// +kubebuilder:validation:Optional
-	Username string `json:"username,omitempty"`
-
-	// Password is the password for the database.
-	// +kubebuilder:validation:Optional
-	Password string `json:"password,omitempty"`
+	Verification *commonsv1alpha1.TLSVerificationSpec `json:"verification,omitempty"`
 }
 
+// DatabaseConnectionStatus defines the observed state of DatabaseConnection.
 type DatabaseConnectionStatus struct {
 	// +kubebuilder:validation:Optional
 	Conditions []metav1.Condition `json:"condition,omitempty"`
 }
 
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
-
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 // DatabaseConnection is the Schema for the databaseconnections API
 type DatabaseConnection struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -105,63 +87,70 @@ type DatabaseConnection struct {
 	Status DatabaseConnectionStatus `json:"status,omitempty"`
 }
 
-//+kubebuilder:object:root=true
-
-// DatabaseConnectionList contains a list of DatabaseConnection
+// +kubebuilder:object:root=true
+// DatabaseConnectionList contains a list of DatabaseConnection.
 type DatabaseConnectionList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []DatabaseConnection `json:"items"`
 }
 
-// DatabaseConnectionProvider defines the enum provider for DataConnection.
-// You can choose one of mysql, postgres, redis, and provider is required.
-type DatabaseConnectionProvider struct {
-	// +kubebuilder:validation:Optional
-	Mysql *MysqlProvider `json:"mysql,omitempty"`
-	// +kubebuilder:validation:Optional
-	Postgres *PostgresProvider `json:"postgres,omitempty"`
-	// +kubebuilder:validation:Optional
-	Redis *RedisProvider `json:"redis,omitempty"`
+// GetHost returns the database host.
+func (d *DatabaseConnectionSpec) GetHost() string {
+	return d.Host
 }
 
-// MysqlProvider defines the desired connection info of Mysql
-type MysqlProvider struct {
-	// +kubebuilder:default=mysql
-	// +kubebuilder:validation:Required
-	Driver string `json:"driver,omitempty"`
-	// +kubebuilder:validation:Required
-	Host string `json:"host,omitempty"`
-	// +kubebuilder:validation:Required
-	Port int `json:"port,omitempty"`
-	// +kubebuilder:validation:Required
-	SSL bool `json:"ssl,omitempty"`
-	// +kubebuilder:validation:Required
-	Credential *DatabaseCredentialSpec `json:"credential,omitempty"`
+// GetPort returns the database port.
+func (d *DatabaseConnectionSpec) GetPort() int {
+	return d.Port
 }
 
-// PostgresProvider defines the desired connection info of Postgres
-type PostgresProvider struct {
-	// +kubebuilder:default=org.postgresql.Driver
-	Driver string `json:"driver,omitempty"`
-	// +kubebuilder:validation:Required
-	Host string `json:"host,omitempty"`
-	// +kubebuilder:validation:Required
-	Port int `json:"port,omitempty"`
-	// +kubebuilder:validation:Required
-	SSL bool `json:"ssl,omitempty"`
-	// +kubebuilder:validation:Required
-	Credential *DatabaseCredentialSpec `json:"credential,omitempty"`
+// GetDriver returns the database driver.
+func (d *DatabaseConnectionSpec) GetDriver() DatabaseDriver {
+	return d.Driver
 }
 
-// RedisProvider defines the desired connection info of Redis
-type RedisProvider struct {
-	// +kubebuilder:validation:Required
-	Host string `json:"host,omitempty"`
-	// +kubebuilder:validation:Required
-	Port string `json:"port,omitempty"`
+// GetDatabase returns the database name.
+func (d *DatabaseConnectionSpec) GetDatabase() string {
+	return d.Database
+}
+
+// GetCredentials returns the credentials specification.
+func (d *DatabaseConnectionSpec) GetCredentials() *commonsv1alpha1.Credentials {
+	return d.Credentials
+}
+
+// GetTLS returns the TLS configuration.
+func (d *DatabaseConnectionSpec) GetTLS() *TLS {
+	return d.TLS
+}
+
+// HasTLS returns true if TLS is configured.
+func (d *DatabaseConnectionSpec) HasTLS() bool {
+	return d.TLS != nil
+}
+
+// IsMySQL returns true if the driver is MySQL.
+func (d *DatabaseConnectionSpec) IsMySQL() bool {
+	return d.Driver == DatabaseDriverMySQL
+}
+
+// IsPostgres returns true if the driver is PostgreSQL.
+func (d *DatabaseConnectionSpec) IsPostgres() bool {
+	return d.Driver == DatabaseDriverPostgres
+}
+
+// IsMariaDB returns true if the driver is MariaDB.
+func (d *DatabaseConnectionSpec) IsMariaDB() bool {
+	return d.Driver == DatabaseDriverMariaDB
+}
+
+// Validate checks if the DatabaseConnectionSpec is valid.
+func (d *DatabaseConnectionSpec) Validate() error {
+	// Validation logic can be extended as needed
+	return nil
 }
 
 func init() {
-	SchemeBuilder.Register(&Database{}, &DatabaseList{}, &DatabaseConnection{}, &DatabaseConnectionList{})
+	SchemeBuilder.Register(&DatabaseConnection{}, &DatabaseConnectionList{})
 }

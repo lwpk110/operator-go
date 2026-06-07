@@ -1,5 +1,5 @@
 /*
-Copyright 2024 zncdatadev.
+Copyright 2024 ZNCDataDev.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,13 +40,21 @@ type AuthenticationProvider struct {
 	OIDC *OIDCProvider `json:"oidc,omitempty"`
 
 	// +kubebuilder:validation:Optional
-	TLS *TLSPrivider `json:"tls,omitempty"`
+	TLS *TLSProvider `json:"tls,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	Static *StaticProvider `json:"static,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	LDAP *LDAPProvider `json:"ldap,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	Kerberos *KerberosProvider `json:"kerberos,omitempty"`
+}
+
+type KerberosProvider struct {
+	// +kubebuilder:validation:Optional
+	KerberosStorageClass string `json:"kerberosStorageClass,omitempty"`
 }
 
 type OIDCProvider struct {
@@ -55,101 +63,113 @@ type OIDCProvider struct {
 	Hostname string `json:"hostname"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
 	Port int `json:"port,omitempty"`
 
+	// +kubebuilder:validation:Required
 	PrincipalClaim string `json:"principalClaim"`
 
 	// +kubebuilder:validation:Required
-	// +kubebuilder:validation:Enum=oidc;keycloak;dexidp;authentik
+	// +kubebuilder:validation:Enum=keycloak
 	ProviderHint string `json:"providerHint"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default="/"
 	RootPath string `json:"rootPath,omitempty"`
 
 	// +kubebuilder:validation:Optional
 	Scopes []string `json:"scopes,omitempty"`
 
 	// +kubebuilder:validation:Optional
-	TLS *TLS `json:"tls,omitempty"`
+	TLS *OIDCTls `json:"tls,omitempty"`
 }
 
-type TLSPrivider struct {
+type OIDCTls struct {
+	// +kubebuilder:validation
+	Verification *commonsv1alpha1.TLSVerificationSpec `json:"verification"`
+}
+
+type TLSProvider struct {
 	// +kubebuilder:validation:Optional
-	SecretClass string `json:"secretClass,omitempty"`
+	ClientCertSecretClass string `json:"clientCertSecretClass,omitempty"`
 }
 
 type StaticProvider struct {
-	CerdentialSecret string `json:"credential"`
+	// +kubebuilder:validation:Required
+	UserCredentialsSecret *StaticCredentialsSecret `json:"userCredentialsSecret"`
+}
+
+type StaticCredentialsSecret struct {
+	// The secret name that contains the user credentials.
+	// The data contained in secret is related to the data required for the specific product certification function.
+	// +kubebuilder:validation:Required
+	Name string `json:"name"`
 }
 
 type LDAPProvider struct {
-	// +kubebuilder:validation:Required
-	Credential *LDAPCredential `json:"credential"`
+	// Provide ldap credentials mounts for Pods via k8s-search secret-class.
+	// The secret searched by k8s-search must contain the following data:
+	//  - user: bind user, e.g. cn=admin,dc=example,dc=com
+	//  - password: bind password
+	BindCredentials *commonsv1alpha1.Credentials `json:"bindCredentials"`
 
 	// +kubebuilder:validation:Required
 	Hostname string `json:"hostname"`
 
+	// LDAP server port. Default is 389, if tls default is 636.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
 	Port int `json:"port,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default={"email": "mail", "givenName": "givenName", "group": "memberof", "surname": "sn", "uid": "uid"}
 	LDAPFieldNames *LDAPFieldNames `json:"ldapFieldNames,omitempty"`
 
-	// LDAP search base, for example: ou=users,dc=example,dc=org.
+	// LDAP search base, for example: ou=users,dc=example,dc=com.
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=""
 	SearchBase string `json:"searchBase,omitempty"`
 
-	// LDAP search filter, for example: (uid=%s).
+	// LDAP search filter, for example: (ou=teams,dc=example,dc=com).
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=""
 	SearchFilter string `json:"searchFilter,omitempty"`
 
 	// +kubebuilder:validation:Optional
-	TLS *TLS `json:"tls,omitempty"`
+	TLS *LDAPTLS `json:"tls,omitempty"`
 }
 
-type TLS struct {
-	// +kubebuilder:validation:Optional
-	Verification *commonsv1alpha1.TLSVerificationSpec `json:"verification,omitempty"`
-}
-
-type LDAPCredential struct {
-	// +kubebuilder:validation:Optional
-	Scopes *CrendentialScope `json:"scopes,omitempty"`
-
+type LDAPTLS struct {
 	// +kubebuilder:validation:Required
-	SecretClass string `json:"secretClass"`
-}
-
-type CrendentialScope struct {
-	// +kubebuilder:validation:Optional
-	Node string `json:"node,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	Pod string `json:"pod,omitempty"`
-
-	// +kubebuilder:validation:Optional
-	Services []string `json:"services,omitempty"`
+	Verification *commonsv1alpha1.TLSVerificationSpec `json:"verification"`
 }
 
 type LDAPFieldNames struct {
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=mail
 	Email string `json:"email,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=givenName
 	GivenName string `json:"givenName,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=memberof
 	Group string `json:"group,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=sn
 	Surname string `json:"surname,omitempty"`
 
 	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=uid
 	Uid string `json:"uid,omitempty"`
 }
 
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:path=authenticationclasses,scope=Cluster,shortName=authclass
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // AuthenticationClass is the Schema for the authenticationclasses API
 type AuthenticationClass struct {
@@ -164,7 +184,7 @@ type AuthenticationClass struct {
 type AuthenticationClassStatus struct {
 }
 
-//+kubebuilder:object:root=true
+// +kubebuilder:object:root=true
 
 // AuthenticationClassList contains a list of AuthenticationClass
 type AuthenticationClassList struct {
