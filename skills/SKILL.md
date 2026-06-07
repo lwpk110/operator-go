@@ -25,7 +25,7 @@ metadata:
 ## Reference Guide
 
 | Topic | Reference | Load When |
-|---|---|---|
+| --- | --- | --- |
 | 架构与目录蓝图 | `references/architecture.md` | 新建产品 Operator，需要先做整体结构设计 |
 | CRD 与调和实现 | `references/reconcile-implementation.md` | 需要定义 CRD、实现 `ClusterInterface`、接入 `GenericReconciler` |
 | Webhook 与校验 | `references/webhook-validation.md` | 需要默认值、字段约束、不可变字段校验 |
