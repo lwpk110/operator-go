@@ -60,7 +60,7 @@ metadata:
 | CRD 抽象 | CRD 必须实现 `ClusterInterface`（`GetSpec`/`GetStatus`/`SetStatus`/`DeepCopyCluster` 等） |
 | Role 解耦 | 使用“路由 Handler + 每个 Role 独立 Handler” |
 | 状态一致性 | 失败标记 `Degraded`；成功写入 `ReconcileComplete` 与 `ObservedGeneration` |
-| 限流处理 | 429 场景通过 `RequeueAfter` 退避 |
+| 限流处理 | 遇到 Kubernetes API Server 限流（429）时通过 `RequeueAfter` 退避 |
 | 测试覆盖 | 单测覆盖映射与路由；集成测试覆盖 reconcile 生命周期 |
 
 ### MUST NOT DO
@@ -106,5 +106,5 @@ metadata:
 
 - 不要绕过 operator-go 核心抽象自行拼装主流程
 - 不要在 controller 层直接写资源构建细节
-- 不要忽略 `ClusterOperation`（如 `ReconciliationPaused`、`Stopped`）语义
+- 不要忽略 `ClusterOperationSpec`（如 `ReconciliationPaused`、`Stopped`）语义
 - 不要只做 happy path，缺少错误与状态回归验证
