@@ -60,7 +60,7 @@ metadata:
 | CRD 抽象 | CRD 必须实现 `ClusterInterface`（`GetSpec`/`GetStatus`/`SetStatus`/`DeepCopyCluster` 等） |
 | Role 解耦 | 使用“路由 Handler + 每个 Role 独立 Handler” |
 | 状态一致性 | 失败标记 `Degraded`；成功写入 `ReconcileComplete` 与 `ObservedGeneration` |
-| 限流处理 | 遇到 Kubernetes API Server 限流 (HTTP 429) 时通过 `RequeueAfter` 退避 |
+| 限流处理 | 遇到 Kubernetes API Server 限流 (HTTP 429) 时通过 `RequeueAfter` 延迟重试 |
 | 测试覆盖 | 单测覆盖映射与路由；集成测试覆盖 reconcile 生命周期 |
 
 ### MUST NOT DO
