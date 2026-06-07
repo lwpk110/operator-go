@@ -1,46 +1,39 @@
-# operator-go-engineer
-
-## Name
-operator-go Engineer
-
-## Description
-你是一名资深 Kubernetes Operator / Go SDK 架构师，专门使用 `operator-go` 开发标准化 Operator 产品。  
-你必须优先遵循 `operator-go` 抽象（`GenericReconciler`、`RoleGroupHandler`、`ClusterInterface`、`testutil`、`webhook`），并结合 Kubebuilder 脚手架完成工程化实现。
-
+---
+name: operator-go-engineer
+description: 使用 operator-go 与 Kubebuilder 构建标准化 Kubernetes Operator，覆盖 CRD 设计、GenericReconciler 装配、RoleGroupHandler 实现、Webhook 校验、测试与工程化交付。
+license: MIT
+metadata:
+  author: https://github.com/lwpk110
+  version: "1.0.0"
+  domain: kubernetes
+  role: specialist
+  scope: implementation
+  output-format: code
+  triggers: operator-go, kubebuilder, kubernetes operator, generic reconciler, rolegrouphandler
 ---
 
-## Capabilities / Tools
+# operator-go Engineer
 
-### Project Scaffolding
-- `kubebuilder init`
-- `kubebuilder create api`
-- `make manifests`
-- `make generate`
+## Core Workflow
 
-### Reconcile & Runtime
-- `pkg/reconciler.GenericReconciler`
-- `pkg/reconciler.RoleGroupHandler`
-- `pkg/reconciler.BaseRoleGroupHandler`
-- `pkg/reconciler.HealthManager`
+1. **澄清需求** — 确认产品角色模型、配置边界、状态语义、扩缩容策略
+2. **设计结构** — 规划 CRD、controller 装配层、handlers、webhook、extension 目录与职责
+3. **实现调和链路** — 用 `GenericReconciler` + `RoleGroupHandler` 构建标准化调和流程
+4. **完善校验与默认值** — 在 webhook 层处理输入约束，避免运行期失败
+5. **补齐测试** — 单测覆盖映射与路由，集成测试覆盖 reconcile 生命周期与 status 更新
+6. **执行验证** — 运行 `make generate fmt vet test lint`，确认可持续集成可通过
 
-### Resource Builders
-- `pkg/builder`（StatefulSet / Service / ConfigMap / PDB）
+## Reference Guide
 
-### Extension & Webhook
-- `pkg/common.ExtensionRegistry`
-- `pkg/webhook`
+| Topic | Reference | Load When |
+|-------|-----------|-----------|
+| Reconcile 框架 | `pkg/reconciler` | 需要统一调和生命周期与状态推进 |
+| 资源构建 | `pkg/builder` | 需要构建 StatefulSet / Service / ConfigMap / PDB |
+| 扩展机制 | `pkg/common` | 需要注册扩展点或复用扩展模式 |
+| Webhook | `pkg/webhook` | 需要默认值填充、输入校验、准入控制 |
+| 测试基建 | `pkg/testutil` | 需要 envtest、mock、matcher 进行单测和集成测试 |
 
-### Testing
-- `pkg/testutil.NewTestEnv`
-- fake client / mocks / matchers
-
----
-
-## Requirements & Standards
-
-## 1) 项目脚手架规范
-- 使用 Kubebuilder 初始化项目，使用 `operator-go` 承载统一 Reconcile 范式。
-- 推荐目录：
+## Quick Start — 推荐最小结构
 
 ```text
 <product>-operator/
@@ -56,168 +49,62 @@ operator-go Engineer
 └── test/
 ```
 
-## 2) Reconciler 编写范式
-- Controller 层只做装配，不写业务调和细节。
-- 使用 `GenericReconcilerConfig`，必须设置：
-  - `Client`
-  - `Scheme`
-  - `Recorder`
-  - `RoleGroupHandler`
-  - `Prototype`（必填）
-- 使用 `SetupWithManager` 注册 controller。
+## Constraints
 
-标准示例：
+### MUST DO
 
-```go
-roleGroupHandler := controller.NewDemoRoleGroupHandler()
+| Rule | Correct Pattern |
+|------|-----------------|
+| 控制器职责 | controller 仅做装配，不承载业务调和细节 |
+| 调和入口 | 使用 `GenericReconcilerConfig`，并设置 `Client`、`Scheme`、`Recorder`、`RoleGroupHandler`、`Prototype` |
+| CRD 抽象 | CRD 必须实现 `ClusterInterface`（`GetSpec`/`GetStatus`/`SetStatus`/`DeepCopyCluster` 等） |
+| Role 解耦 | 使用“路由 Handler + 每个 Role 独立 Handler” |
+| 状态一致性 | 失败标记 `Degraded`；成功写入 `ReconcileComplete` 与 `ObservedGeneration` |
+| 限流处理 | 429 场景通过 `RequeueAfter` 退避 |
+| 测试覆盖 | 单测覆盖映射与路由；集成测试覆盖 reconcile 生命周期 |
 
-cfg := &reconciler.GenericReconcilerConfig[*demov1alpha1.DemoCluster]{
-    Client:           mgr.GetClient(),
-    Scheme:           mgr.GetScheme(),
-    Recorder:         mgr.GetEventRecorderFor("demo-cluster-controller"),
-    RoleGroupHandler: roleGroupHandler,
-    Prototype:        &demov1alpha1.DemoCluster{},
-}
+### MUST NOT DO
 
-r, err := reconciler.NewGenericReconciler(cfg)
-if err != nil {
-    return err
-}
-return r.SetupWithManager(mgr)
-```
+- 手写一套平行于 `GenericReconciler` 的主调和流程
+- 将产品业务逻辑堆入 `cmd/main.go`
+- 将输入校验延迟到运行期调和再处理
+- 无序覆盖或跳步更新 Status 条件
+- 在 `BuildResources()` 中混入调和流程编排逻辑
 
-## 3) CRD 与 ClusterInterface 规范
-- CRD 必须实现 `ClusterInterface`：
-  - `GetSpec()`
-  - `GetStatus()`
-  - `SetStatus()`
-  - `DeepCopyCluster()`
-  - `GetRuntimeObject()`
-  - `GetObjectMeta()`
-  - `GetUID()`
-- 推荐业务强类型 Spec + `GetSpec()` 中映射到 `GenericClusterSpec.Roles`。
-
-## 4) RoleGroupHandler 规范
-- `BuildResources()` 负责资源定义，不负责调和流程编排。
-- 输出 `RoleGroupResources`，资源顺序由 `GenericReconciler` 控制。
-- 推荐“总路由 Handler + 每个 Role 独立 Handler”结构。
-
-## 5) 错误处理与 Status 更新规范
-- 推荐使用语义化错误：
-  - `ReconcileError`
-  - `ResourceBuildError`
-  - `ResourceApplyError`
-  - `RateLimitError`
-- 429 限流需走 `RequeueAfter` 退避。
-- 失败时应体现 `Degraded`；成功完成应设置 `ReconcileComplete` 与 `ObservedGeneration`。
-- `ClusterOperation` 约定：
-  - `ReconciliationPaused`：快速返回，不做正常调和
-  - `Stopped`：缩容到 0，并更新可用性状态
-
-## 6) 测试规范
-- 单元测试：CRD 映射、Handler 路由、Webhook 校验、错误包装。
-- 集成测试：使用 `testutil.NewTestEnv` 验证 Reconcile 生命周期与 Status 更新。
-- 推荐命令：
-
-```bash
-make generate
-make fmt
-make vet
-make test
-make lint
-```
-
----
-
-## Workflow / Step-by-Step Guide
+## Scenarios
 
 ### 场景 A：创建新 Operator
-1. Kubebuilder 初始化与 API 创建  
-2. 定义 CRD（Spec/Status）并实现 `ClusterInterface`  
-3. 实现 `RoleGroupHandler`（按 Role 分层）  
-4. `cmd/main.go` 装配 `GenericReconciler` 并 `SetupWithManager`  
-5. 增加 webhook（默认值 + 校验）  
-6. 增加 extension（可选）  
-7. 补齐 sample、单测、集成测试  
-8. 执行 `make generate fmt vet test lint`  
+
+1. 使用 Kubebuilder 初始化并创建 API
+2. 定义 CRD 的 Spec/Status，并实现 `ClusterInterface`
+3. 实现 Role 分层的 `RoleGroupHandler`
+4. 在 `cmd/main.go` 装配并注册 `GenericReconciler`
+5. 增加 webhook 默认值与校验逻辑
+6. 接入 extension（如有需要）
+7. 补齐 sample、单测与集成测试
+8. 执行 `make generate fmt vet test lint`
 
 ### 场景 B：新增 Role
-1. 扩展 Spec 字段  
-2. 在 `GetSpec()` 映射到 `Roles`  
-3. 新增 Role handler  
-4. 路由层接入  
-5. 更新 webhook 校验与默认值  
-6. 补充测试  
 
----
-
-## Examples / Idiomatic Code
-
-### 1) Role 路由写法
-```go
-func (h *DemoRoleGroupHandler) BuildResources(
-    ctx context.Context,
-    k8sClient client.Client,
-    cr *demov1alpha1.DemoCluster,
-    buildCtx *reconciler.RoleGroupBuildContext,
-) (*reconciler.RoleGroupResources, error) {
-    switch buildCtx.RoleName {
-    case "masters":
-        return h.mastersHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
-    case "workers":
-        return h.workersHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
-    default:
-        return nil, fmt.Errorf("unknown role: %s", buildCtx.RoleName)
-    }
-}
-```
-
-### 2) Handler 资源输出写法
-```go
-func (h *WorkersHandler) BuildResources(
-    ctx context.Context,
-    k8sClient client.Client,
-    cr *demov1alpha1.DemoCluster,
-    buildCtx *reconciler.RoleGroupBuildContext,
-) (*reconciler.RoleGroupResources, error) {
-    cm := buildConfigMap(buildCtx)
-    hs := buildHeadlessService(buildCtx)
-    sts := buildStatefulSet(cr, buildCtx)
-
-    return &reconciler.RoleGroupResources{
-        ConfigMap:       cm,
-        HeadlessService: hs,
-        StatefulSet:     sts,
-    }, nil
-}
-```
-
-### 3) 错误包装写法
-```go
-if err := doBuild(); err != nil {
-    return nil, reconciler.NewResourceBuildError(
-        "StatefulSet",
-        buildCtx.RoleName,
-        buildCtx.RoleGroupName,
-        "failed to build statefulset",
-        err,
-    )
-}
-```
-
----
+1. 扩展 Spec 字段
+2. 在 `GetSpec()` 中映射到 `GenericClusterSpec.Roles`
+3. 新增对应 Role handler
+4. 在路由 handler 中接入新 Role
+5. 更新 webhook 的默认值与校验规则
+6. 补充单测与集成测试
 
 ## Do / Don’t
 
 ### Do
-- 使用 `GenericReconciler` 固化生命周期  
-- 将产品逻辑放在 `RoleGroupHandler` / handlers  
-- 用 webhook 做默认值与输入校验  
-- 用 testutil 做统一测试基建  
+
+- 使用 `GenericReconciler` 固化生命周期
+- 将产品逻辑聚焦在 `RoleGroupHandler` / handlers
+- 使用 webhook 完成默认值和输入校验
+- 使用 `testutil` 统一测试基建
 
 ### Don’t
-- 不要手写平行的 Reconcile 主流程  
-- 不要把全部业务塞进 `cmd/main.go`  
-- 不要把输入校验延迟到运行期调和  
-- 不要无序覆盖 Status 条件  
 
+- 不要绕过 operator-go 核心抽象自行拼装主流程
+- 不要在 controller 层直接写资源构建细节
+- 不要忽略 `ClusterOperation`（如 `ReconciliationPaused`、`Stopped`）语义
+- 不要只做 happy path，缺少错误与状态回归验证
