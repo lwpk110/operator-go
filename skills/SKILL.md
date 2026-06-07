@@ -1,10 +1,10 @@
 ---
 name: operator-go-engineer
-description: 使用 operator-go 与 Kubebuilder 构建标准化 Kubernetes Operator，覆盖 CRD 设计、GenericReconciler 装配、RoleGroupHandler 实现、Webhook 校验、测试与工程化交付。
+description: 基于 operator-go 构建可复用 Kubernetes Operator，面向新产品快速落地 CRD、调和链路、Webhook、扩展与测试交付。
 license: MIT
 metadata:
   author: https://github.com/lwpk110
-  version: "1.0.0"
+  version: "1.1.0"
   domain: kubernetes
   role: specialist
   scope: implementation
@@ -16,22 +16,22 @@ metadata:
 
 ## Core Workflow
 
-1. **澄清需求** — 确认产品角色模型、配置边界、状态语义、扩缩容策略
-2. **设计结构** — 规划 CRD、controller 装配层、handlers、webhook、extension 目录与职责
-3. **实现调和链路** — 用 `GenericReconciler` + `RoleGroupHandler` 构建标准化调和流程
-4. **完善校验与默认值** — 在 webhook 层处理输入约束，避免运行期失败
-5. **补齐测试** — 单测覆盖映射与路由，集成测试覆盖 reconcile 生命周期与 status 更新
-6. **执行验证** — 运行 `make generate fmt vet test lint`，确认可持续集成可通过
+1. **需求建模** — 明确产品角色、状态语义、配置边界、依赖与伸缩策略
+2. **框架选型** — 固定 `operator-go + Kubebuilder`，避免自行实现平行调和主流程
+3. **分层落地** — 按 CRD、controller 装配、handlers、webhook、extensions 切分职责
+4. **实现调和** — 使用 `GenericReconcilerConfig` 与 `RoleGroupHandler` 构建统一调和链路
+5. **质量闭环** — 完成默认值、校验、状态回写、测试与发布前验证
 
 ## Reference Guide
 
 | Topic | Reference | Load When |
-|-------|-----------|-----------|
-| Reconcile 框架 | `pkg/reconciler` | 需要统一调和生命周期与状态推进 |
-| 资源构建 | `pkg/builder` | 需要构建 StatefulSet / Service / ConfigMap / PDB |
-| 扩展机制 | `pkg/common` | 需要注册扩展点或复用扩展模式 |
-| Webhook | `pkg/webhook` | 需要默认值填充、输入校验、准入控制 |
-| 测试基建 | `pkg/testutil` | 需要 envtest、mock、matcher 进行单测和集成测试 |
+|---|---|---|
+| 架构与目录蓝图 | `references/architecture.md` | 新建产品 Operator，需要先做整体结构设计 |
+| CRD 与调和实现 | `references/reconcile-implementation.md` | 需要定义 CRD、实现 `ClusterInterface`、接入 `GenericReconciler` |
+| Webhook 与校验 | `references/webhook-validation.md` | 需要默认值、字段约束、不可变字段校验 |
+| Extension 与配置生成 | `references/extensions-config.md` | 需要扩展生命周期 Hook、动态配置文件、Sidecar 组合 |
+| 测试与交付 | `references/testing-delivery.md` | 需要补齐单测/集成测试、执行发布前检查 |
+| Trino 对照模板 | `references/trino-mapping.md` | 需要参考 `examples/trino-operator` 迁移到其他产品 |
 
 ## Quick Start — 推荐最小结构
 
@@ -53,58 +53,25 @@ metadata:
 
 ### MUST DO
 
-| Rule | Correct Pattern |
-|------|-----------------|
-| 控制器职责 | controller 仅做装配，不承载业务调和细节 |
-| 调和入口 | 使用 `GenericReconcilerConfig`，并设置 `Client`、`Scheme`、`Recorder`、`RoleGroupHandler`、`Prototype` |
-| CRD 抽象 | CRD 必须实现 `ClusterInterface`（`GetSpec`/`GetStatus`/`SetStatus`/`DeepCopyCluster` 等） |
-| Role 解耦 | 使用“路由 Handler + 每个 Role 独立 Handler” |
-| 状态一致性 | 失败标记 `Degraded`；成功写入 `ReconcileComplete` 与 `ObservedGeneration` |
-| 限流处理 | 遇到 Kubernetes API Server 限流 (HTTP 429) 时通过 `RequeueAfter` 延迟重试 |
-| 测试覆盖 | 单测覆盖映射与路由；集成测试覆盖 reconcile 生命周期 |
+- controller 仅做装配：Manager、Reconciler、Webhook 注册，不承载业务资源构建
+- CRD 实现 `ClusterInterface`，通过 `GetSpec/GetStatus/SetStatus/DeepCopyCluster` 对接框架
+- 角色处理采用“路由 Handler + 每个 Role 独立 Handler”模式
+- 状态更新遵循统一语义：失败标记 `Degraded`，成功写入 `ReconcileComplete` 与 `ObservedGeneration`
+- 在 webhook 完成默认值与输入校验，避免问题下沉到运行期
+- 对限流/暂时性错误使用 `RequeueAfter` 延迟重试
 
 ### MUST NOT DO
 
-- 手写一套平行于 `GenericReconciler` 的主调和流程
-- 将产品业务逻辑堆入 `cmd/main.go`
-- 将输入校验延迟到运行期调和再处理
-- 无序覆盖或跳步更新 Status 条件
-- 在 `BuildResources()` 中混入调和流程编排逻辑
+- 不要手写独立于 `GenericReconciler` 的主调和流程
+- 不要把产品业务逻辑堆在 `cmd/main.go`
+- 不要在 `BuildResources()` 中混入流程编排与状态管理
+- 不要跳过 webhook 默认值与校验直接依赖运行期容错
+- 不要只覆盖 happy path 测试
 
-## Scenarios
+## Scenario Routing
 
-### 场景 A：创建新 Operator
-
-1. 使用 Kubebuilder 初始化并创建 API
-2. 定义 CRD 的 Spec/Status，并实现 `ClusterInterface`
-3. 实现 Role 分层的 `RoleGroupHandler`
-4. 在 `cmd/main.go` 装配并注册 `GenericReconciler`
-5. 增加 webhook 默认值与校验逻辑
-6. 接入 extension（如有需要）
-7. 补齐 sample、单测与集成测试
-8. 执行 `make generate fmt vet test lint`
-
-### 场景 B：新增 Role
-
-1. 扩展 Spec 字段
-2. 在 `GetSpec()` 中映射到 `GenericClusterSpec.Roles`
-3. 新增对应 Role handler
-4. 在路由 handler 中接入新 Role
-5. 更新 webhook 的默认值与校验规则
-6. 补充单测与集成测试
-
-## Do / Don’t
-
-### Do
-
-- 使用 `GenericReconciler` 固化生命周期
-- 将产品逻辑聚焦在 `RoleGroupHandler` / handlers
-- 使用 webhook 完成默认值和输入校验
-- 使用 `testutil` 统一测试基建
-
-### Don’t
-
-- 不要绕过 operator-go 核心抽象自行拼装主流程
-- 不要在 controller 层直接写资源构建细节
-- 不要忽略 `GenericClusterSpec.ClusterOperation`（如 `ReconciliationPaused`、`Stopped`）语义
-- 不要只做 happy path，缺少错误与状态回归验证
+- **新产品从 0 到 1**：先读 `references/architecture.md` + `references/reconcile-implementation.md`
+- **新增一个 Role**：读 `references/reconcile-implementation.md` + `references/webhook-validation.md`
+- **新增扩展或配置系统**：读 `references/extensions-config.md`
+- **准备提测或发布**：读 `references/testing-delivery.md`
+- **需要可运行模板对照**：读 `references/trino-mapping.md`
