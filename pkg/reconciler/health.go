@@ -19,22 +19,18 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/common"
+	"github.com/zncdatadev/operator-go/pkg/constant"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-)
-
-// Default health check configuration.
-const (
-	DefaultCheckInterval = 120 * time.Second
-	DefaultTimeout       = 300 * time.Second
 )
 
 // HealthManager manages health checks and status updates.
@@ -49,8 +45,8 @@ type HealthManager struct {
 func NewHealthManager(client client.Client) *HealthManager {
 	return &HealthManager{
 		Client:        client,
-		CheckInterval: DefaultCheckInterval,
-		Timeout:       DefaultTimeout,
+		CheckInterval: DefaultHealthCheckInterval,
+		Timeout:       DefaultHealthCheckTimeout,
 	}
 }
 
@@ -62,43 +58,78 @@ func (h *HealthManager) WithServiceHealthCheck(check common.ServiceHealthCheck) 
 	return h
 }
 
-// Check performs health checks and updates status.
+// Check evaluates the cluster's workloads and writes the Available, Progressing, Degraded,
+// ServiceHealthy and Paused conditions. It reads only; nothing here mutates a cluster resource.
+//
+// The three workload conditions answer three different questions, and keeping them apart is the
+// whole point of this function:
+//
+//   - Available — are at least as many replicas ready as the spec asks for? "Can it serve?"
+//   - Progressing — is a revision rollout or a replica change in flight? "Is it changing?"
+//   - Degraded — is something wrong that the operator cannot fix on its own? "Must a human look?"
+//
+// Degraded used to be derived from the replica counts, which conflated it with the other two: a
+// rolling update, a scale-up and a scale-down all reduce ready replicas on purpose, so every routine
+// change reported Degraded=True — a scale-down reported it with Progressing=False, so nothing in the
+// status even hinted that the cluster was mid-operation. A signal that fires on every planned change
+// is one nobody can alert on. Degraded is therefore computed from *failure states* instead: a pod
+// wedged in CrashLoopBackOff or unable to pull its image, a pod nowhere to schedule, a StatefulSet
+// that cannot be read, or a failing application health check. Those are state-based, not
+// time-based, so a stuck rollout still reports Degraded=True — the pods are visibly failing — while
+// a healthy rollout does not.
 func (h *HealthManager) Check(ctx context.Context, namespace, clusterName string, spec *v1alpha1.GenericClusterSpec, status *v1alpha1.GenericClusterStatus) error {
 	logger := log.FromContext(ctx)
 
-	// Check cluster operation
-	if spec.ClusterOperation != nil {
-		if spec.ClusterOperation.ReconciliationPaused {
-			status.SetDegraded(true, v1alpha1.ReasonReconciliationPaused, "Reconciliation is paused")
-			return nil
+	paused := spec.ClusterOperation != nil && spec.ClusterOperation.ReconciliationPaused
+
+	if spec.ClusterOperation != nil && spec.ClusterOperation.Stopped && !paused {
+		status.SetUnavailable(v1alpha1.ReasonStopped, "Cluster is stopped")
+		status.SetDegraded(false, v1alpha1.ReasonStopped, "Cluster is intentionally stopped")
+		// Every condition this pass can write has to be written, including on the early
+		// returns: a condition left untouched keeps whatever the last running cycle put
+		// there, so a cluster stopped mid-rollout would advertise Progressing=True (and a
+		// healthy service) for as long as it stays stopped.
+		status.SetProgressing(false, v1alpha1.ReasonStopped, "Cluster is stopped")
+		status.SetPaused(false, v1alpha1.ReasonStopped, "Cluster is stopped, not paused")
+		if h.serviceHealthCheck != nil {
+			status.SetServiceHealthy(false, v1alpha1.ReasonStopped, "Cluster is stopped")
 		}
-		if spec.ClusterOperation.Stopped {
-			status.SetUnavailable(v1alpha1.ReasonStopped, "Cluster is stopped")
-			status.SetDegraded(false, v1alpha1.ReasonStopped, "Cluster is intentionally stopped")
-			return nil
-		}
+		return nil
 	}
 
-	// Check pod health for each role group
-	allHealthy := true
-	allAvailable := true
+	// Evaluate every role group's workload. The two ways a role group can be unavailable are kept
+	// apart, because they need different words: one has replica counts to compare, the other has no
+	// StatefulSet to read at all.
 	progressing := false
+	evaluated := 0
+	var shortOfReplicas, unreadable, creating []string
 
 	for roleName, roleSpec := range spec.Roles {
 		for groupName, groupSpec := range roleSpec.RoleGroups {
-			resourceName := fmt.Sprintf("%s-%s", clusterName, groupName)
-			healthy, available, isProgressing, err := h.checkRoleGroupHealth(ctx, namespace, resourceName, groupSpec.GetReplicas())
+			evaluated++
+			resourceName := RoleGroupResourceName(clusterName, roleName, groupName)
+			available, isProgressing, err := h.checkRoleGroupHealth(ctx, namespace, resourceName, groupSpec.GetReplicas())
 			if err != nil {
+				// "Never applied yet" and "applied, then vanished" are different facts, and the
+				// status already distinguishes them: status.roleGroups is the ledger of role groups
+				// this framework successfully applied. A role group absent from the ledger has no
+				// StatefulSet because the framework has not got that far — a first install, a build
+				// still waiting on something external — which is Creating, not a fault. Reporting it
+				// as Degraded is what made a normal first install page.
+				if !inLedger(status, roleName, groupName) {
+					logger.V(1).Info("Role group has no StatefulSet yet", "role", roleName, "group", groupName)
+					creating = append(creating, roleName+"/"+groupName)
+					continue
+				}
+				// Applied before and unreadable now: the object the operator applied is gone or
+				// unreachable, which is a genuine fault.
 				logger.Error(err, "Failed to check role group health", "role", roleName, "group", groupName)
-				allHealthy = false
+				unreadable = append(unreadable, roleName+"/"+groupName)
 				continue
 			}
 
-			if !healthy {
-				allHealthy = false
-			}
 			if !available {
-				allAvailable = false
+				shortOfReplicas = append(shortOfReplicas, roleName+"/"+groupName)
 			}
 			if isProgressing {
 				progressing = true
@@ -106,11 +137,36 @@ func (h *HealthManager) Check(ctx context.Context, namespace, clusterName string
 		}
 	}
 
-	// Update status conditions
-	if allAvailable {
+	sort.Strings(shortOfReplicas)
+	sort.Strings(unreadable)
+	sort.Strings(creating)
+
+	switch {
+	case evaluated == 0:
+		// No role group was evaluated, so nothing runs. Reporting "all replicas are available"
+		// for a cluster with zero workloads would make Available useless as a readiness gate.
+		status.SetUnavailable(v1alpha1.ReasonCreating, "Cluster declares no role groups")
+	case len(shortOfReplicas) == 0 && len(unreadable) == 0 && len(creating) == 0:
 		status.SetAvailable(v1alpha1.ReasonAvailable, "All replicas are available")
-	} else {
-		status.SetUnavailable(v1alpha1.ReasonCreating, "Not all replicas are available")
+	default:
+		// Name the offenders, and say which kind of problem each one is: with several roles the
+		// generic message forced an operator to go looking, and calling an unreadable StatefulSet
+		// "short of ready replicas" would send them looking for replica counts that do not exist.
+		var parts []string
+		if len(shortOfReplicas) > 0 {
+			parts = append(parts, "fewer ready replicas than desired: "+strings.Join(shortOfReplicas, ", "))
+		}
+		if len(unreadable) > 0 {
+			parts = append(parts, "StatefulSet could not be read: "+strings.Join(unreadable, ", "))
+		}
+		if len(creating) > 0 {
+			parts = append(parts, "not created yet: "+strings.Join(creating, ", "))
+		}
+		// The reason names the WORST kind present, so a cluster that is merely still being built
+		// never reports a fault reason. Ordering: a failing workload outranks a missing one, and a
+		// missing one outranks a not-yet-created one.
+		reason := unavailableReason(shortOfReplicas, unreadable)
+		status.SetUnavailable(reason, "Role groups — "+strings.Join(parts, "; "))
 	}
 
 	if progressing {
@@ -119,104 +175,228 @@ func (h *HealthManager) Check(ctx context.Context, namespace, clusterName string
 		status.SetProgressing(false, v1alpha1.ReasonAvailable, "Cluster is stable")
 	}
 
-	if !allHealthy {
-		status.SetDegraded(true, v1alpha1.ReasonDegraded, "Some replicas are unhealthy")
-	} else {
-		status.SetDegraded(false, v1alpha1.ReasonAvailable, "All replicas are healthy")
+	// The Degraded verdict is computed here and written ONCE at the end of the pass. Writing it
+	// twice — clear after the pod check, set again after the service check — would flip the
+	// condition's status within a single pass, and SetCondition re-stamps LastTransitionTime on
+	// every flip. The status would then differ on every reconcile, defeating the no-op guard in
+	// updateStatus and making the controller reschedule itself indefinitely.
+	degraded := false
+	degradedReason := v1alpha1.ReasonAvailable
+	degradedMessage := "No failing pods"
+
+	if len(unreadable) > 0 {
+		degraded = true
+		degradedReason = v1alpha1.ReasonWorkloadUnreadable
+		degradedMessage = fmt.Sprintf("StatefulSet could not be read for role groups: %s", strings.Join(unreadable, ", "))
+	} else if failures, err := h.findFailingPods(ctx, namespace, clusterName); err != nil {
+		// Not being able to list pods says nothing about the cluster, so it must not be reported as
+		// the cluster's fault. It is logged and the verdict falls back to "no failures observed".
+		logger.Error(err, "Failed to list pods while evaluating cluster health")
+	} else if len(failures) > 0 {
+		degraded = true
+		degradedReason = v1alpha1.ReasonPodFailure
+		degradedMessage = summarizePodFailures(failures)
 	}
 
-	// Run product-level service health check if configured.
-	if h.serviceHealthCheck != nil {
-		healthy, err := h.serviceHealthCheck.CheckHealthy(ctx, h.Client, namespace, clusterName)
-		if err != nil {
+	// Run product-level service health check if configured. It calls out to the product (an
+	// HDFS SafeMode probe, an HTTP readiness endpoint, ...), so it runs under a deadline: an
+	// unbounded probe would pin a reconcile worker for as long as the remote side hangs.
+	//
+	// Skipped while paused: it is an active probe, and a paused cluster is one an administrator has
+	// asked the operator to leave alone. The condition goes Unknown rather than keeping the last
+	// verdict, which would otherwise outlive whatever happens during the pause.
+	switch {
+	case h.serviceHealthCheck == nil:
+	case paused:
+		status.SetServiceHealthyUnknown(v1alpha1.ReasonReconciliationPaused,
+			"Not probed while reconciliation is paused")
+	default:
+		checkCtx := ctx
+		if h.Timeout > 0 {
+			var cancel context.CancelFunc
+			checkCtx, cancel = context.WithTimeout(ctx, h.Timeout)
+			defer cancel()
+		}
+		healthy, err := h.serviceHealthCheck.CheckHealthy(checkCtx, h.Client, namespace, clusterName)
+		switch {
+		case err != nil:
 			logger.Error(err, "Service health check failed")
-			status.SetDegraded(true, v1alpha1.ReasonDegraded, fmt.Sprintf("Service health check error: %v", err))
-			status.SetServiceHealthy(false, v1alpha1.ReasonDegraded, fmt.Sprintf("Service health check error: %v", err))
-			return nil
-		}
-		if !healthy {
-			status.SetDegraded(true, v1alpha1.ReasonDegraded, "Service health check reported unhealthy")
+			message := fmt.Sprintf("Service health check error: %v", err)
+			degraded, degradedReason, degradedMessage = true, v1alpha1.ReasonDegraded, message
+			status.SetServiceHealthy(false, v1alpha1.ReasonDegraded, message)
+		case !healthy:
+			degraded, degradedReason, degradedMessage = true, v1alpha1.ReasonDegraded, "Service health check reported unhealthy"
 			status.SetServiceHealthy(false, v1alpha1.ReasonDegraded, "Service is not healthy")
-			return nil
+		default:
+			status.SetServiceHealthy(true, v1alpha1.ReasonAvailable, "Service is healthy")
 		}
-		status.SetServiceHealthy(true, v1alpha1.ReasonAvailable, "Service is healthy")
 	}
+
+	// Pausing is an administrator's decision, so it gets its own condition and clears Degraded.
+	// Reporting a maintenance window as a fault pages someone for a planned action — and the
+	// framework already treats the sibling operation, `stopped`, exactly this way.
+	if paused {
+		status.SetPaused(true, v1alpha1.ReasonReconciliationPaused, "Reconciliation is paused")
+		status.SetDegraded(false, v1alpha1.ReasonReconciliationPaused,
+			"Reconciliation is paused; the cluster is not being reconciled")
+		return nil
+	}
+
+	status.SetPaused(false, v1alpha1.ReasonReconcileComplete, "Reconciliation is active")
+	status.SetDegraded(degraded, degradedReason, degradedMessage)
 
 	return nil
 }
 
-// checkRoleGroupHealth checks the health of a role group.
-func (h *HealthManager) checkRoleGroupHealth(ctx context.Context, namespace, name string, expectedReplicas int32) (healthy, available, progressing bool, err error) {
-	// Get StatefulSet
+// unavailableReason names the WORST kind of unavailability present, so a cluster that is merely
+// still being built never reports a fault reason. A failing workload outranks a missing one, and a
+// missing one outranks a not-yet-created one.
+func unavailableReason(shortOfReplicas, unreadable []string) string {
+	switch {
+	case len(shortOfReplicas) > 0:
+		return v1alpha1.ReasonPodsNotReady
+	case len(unreadable) > 0:
+		return v1alpha1.ReasonWorkloadUnreadable
+	default:
+		return v1alpha1.ReasonCreating
+	}
+}
+
+// inLedger reports whether status.roleGroups records this role group as one the framework has
+// already applied. It is the only evidence available for telling "not created yet" apart from
+// "created, then lost", and it is written by the apply path after a successful pass.
+func inLedger(status *v1alpha1.GenericClusterStatus, roleName, groupName string) bool {
+	for _, recorded := range status.GetRoleGroups()[roleName] {
+		if recorded == groupName {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRoleGroupHealth reports whether a role group has at least as many ready replicas as the spec
+// asks for, and whether the StatefulSet controller is mid-change.
+//
+// available uses >= rather than ==. A role group scaled DOWN briefly reports more ready replicas
+// than desired while the extra pods terminate, and that is not a problem — the previous `==` test
+// made a plain scale-down look unhealthy, with no rollout in flight to explain it. A role group
+// scaled to 0 on purpose is available at 0 ready replicas for the same reason.
+func (h *HealthManager) checkRoleGroupHealth(ctx context.Context, namespace, name string, expectedReplicas int32) (available, progressing bool, err error) {
 	sts := &appsv1.StatefulSet{}
 	key := types.NamespacedName{Namespace: namespace, Name: name}
 
 	if err = h.Client.Get(ctx, key, sts); err != nil {
-		available = false
-		healthy = false
-		return
+		return false, false, err
 	}
 
-	// Check availability
-	readyReplicas := sts.Status.ReadyReplicas
-	replicas := sts.Status.Replicas
+	available = sts.Status.ReadyReplicas >= expectedReplicas
 
-	available = readyReplicas >= expectedReplicas
-
-	// Check if progressing (update in progress)
+	// A revision rollout, or a replica count the controller has not finished applying.
 	progressing = sts.Status.CurrentRevision != sts.Status.UpdateRevision ||
-		sts.Status.CurrentReplicas != replicas
+		sts.Status.CurrentReplicas != sts.Status.Replicas
 
-	// Check health (all pods ready)
-	healthy = readyReplicas == expectedReplicas && expectedReplicas > 0
-
-	return
+	return available, progressing, nil
 }
 
-// CheckPodHealth checks the health of individual pods.
-func (h *HealthManager) CheckPodHealth(ctx context.Context, namespace string, labels map[string]string) (int, int, error) {
+// stuckContainerReasons are the container `waiting.reason` values that mean the kubelet has given
+// up on its own: retrying will not help, so a human has to change something. Transient startup
+// reasons (ContainerCreating, PodInitializing) are deliberately absent — they are what a healthy
+// pod looks like for its first seconds, and treating them as faults would put every rollout back
+// into Degraded, which is the bug this list exists to avoid.
+var stuckContainerReasons = map[string]struct{}{
+	"CrashLoopBackOff":           {},
+	"ImagePullBackOff":           {},
+	"ErrImagePull":               {},
+	"InvalidImageName":           {},
+	"CreateContainerConfigError": {},
+	"CreateContainerError":       {},
+	"RunContainerError":          {},
+}
+
+// podFailure is one pod the operator cannot help.
+type podFailure struct {
+	pod    string
+	reason string
+}
+
+// findFailingPods lists the cluster's pods and returns those wedged in a state the operator cannot
+// resolve. It is one List for the whole cluster, matched on the framework's own identity labels.
+//
+// This is what makes Degraded independent of whether a rollout is in flight: a bad image reports
+// Degraded=True from the first pod that cannot pull it, even though the StatefulSet is still
+// Progressing, while a healthy rollout produces no failures at all.
+func (h *HealthManager) findFailingPods(ctx context.Context, namespace, clusterName string) ([]podFailure, error) {
 	podList := &corev1.PodList{}
 	if err := h.Client.List(ctx, podList,
 		client.InNamespace(namespace),
-		client.MatchingLabels(labels),
+		client.MatchingLabels{
+			constant.LabelKubernetesInstance:  clusterName,
+			constant.LabelKubernetesManagedBy: managedByValue,
+		},
 	); err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 
-	total := len(podList.Items) // nolint:prealloc
-	ready := 0
-
-	for _, pod := range podList.Items {
-		if h.isPodReady(&pod) {
-			ready++
+	var failures []podFailure
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		// A pod on its way out is not a fault, whoever asked for it to go.
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if reason := podFailureReason(pod); reason != "" {
+			failures = append(failures, podFailure{pod: pod.Name, reason: reason})
 		}
 	}
 
-	return total, ready, nil
+	sort.Slice(failures, func(i, j int) bool { return failures[i].pod < failures[j].pod })
+	return failures, nil
 }
 
-// isPodReady checks if a pod is ready.
-func (h *HealthManager) isPodReady(pod *corev1.Pod) bool {
-	if pod.Status.Phase != corev1.PodRunning {
-		return false
-	}
-
+// podFailureReason returns why a pod is stuck, or "" when it is not.
+func podFailureReason(pod *corev1.Pod) string {
 	for _, cond := range pod.Status.Conditions {
-		if cond.Type == corev1.PodReady {
-			return cond.Status == corev1.ConditionTrue
+		if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse &&
+			cond.Reason == corev1.PodReasonUnschedulable {
+			return corev1.PodReasonUnschedulable
 		}
 	}
-
-	return false
+	// Init and sidecar containers count: a pod whose init container cannot pull its image never
+	// reaches its main container at all.
+	for _, statuses := range [][]corev1.ContainerStatus{
+		pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses,
+	} {
+		for i := range statuses {
+			waiting := statuses[i].State.Waiting
+			if waiting == nil {
+				continue
+			}
+			if _, stuck := stuckContainerReasons[waiting.Reason]; stuck {
+				return waiting.Reason
+			}
+		}
+	}
+	return ""
 }
 
-// UpdateStatusCondition updates a specific status condition.
-func (h *HealthManager) UpdateStatusCondition(status *v1alpha1.GenericClusterStatus, conditionType v1alpha1.ConditionType, statusValue metav1.ConditionStatus, reason, message string) {
-	status.SetCondition(metav1.Condition{
-		Type:               string(conditionType),
-		Status:             statusValue,
-		Reason:             reason,
-		Message:            message,
-		LastTransitionTime: metav1.NewTime(time.Now()),
-	})
+// maxReportedPodFailures bounds the Degraded message. A whole role group failing the same way is
+// one problem, and a condition message listing 200 pods is unreadable in `kubectl describe`.
+const maxReportedPodFailures = 3
+
+// summarizePodFailures renders the Degraded message: the offending pods with their reasons, capped,
+// and never silently truncated — the remainder is counted.
+func summarizePodFailures(failures []podFailure) string {
+	shown := failures
+	if len(shown) > maxReportedPodFailures {
+		shown = shown[:maxReportedPodFailures]
+	}
+	parts := make([]string, 0, len(shown))
+	for _, f := range shown {
+		parts = append(parts, fmt.Sprintf("%s (%s)", f.pod, f.reason))
+	}
+	message := "Pods requiring attention: " + strings.Join(parts, ", ")
+	if remaining := len(failures) - len(shown); remaining > 0 {
+		message += fmt.Sprintf(", and %d more", remaining)
+	}
+	return message
 }

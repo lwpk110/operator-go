@@ -16,6 +16,10 @@ limitations under the License.
 
 package constants
 
+import (
+	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
+)
+
 // Image constants
 const (
 	// DefaultImageRepo is the default container image repository
@@ -26,6 +30,9 @@ const (
 	DefaultImageKubedoopVersion = "0.0.0-dev"
 	// ProductName is the product name used for image resolution
 	ProductName = "trino"
+	// MainContainerName is the name of the main Trino container. It is also the key used to
+	// look up per-container logging config (logging.containers.<name>).
+	MainContainerName = "trino"
 )
 
 // RoleGroup constants
@@ -76,3 +83,17 @@ const (
 	// DefaultWorkerMaxMemory is the default max heap memory for workers
 	DefaultWorkerMaxMemory = "4G"
 )
+
+// ImageDefaults is what spec.image leaves empty, and the single source both the handler and the
+// validating webhook read — so the validator can never reject a spec the handler would resolve.
+//
+// It is a function rather than a var because KubedoopVersion is the operator's own build version in
+// a real operator (here a build-time constant), and it must be read at reconcile time: a webhook
+// that wrote it into the spec would freeze every cluster on the operator version that admitted it.
+func ImageDefaults() commonsv1alpha1.ImageSpec {
+	return commonsv1alpha1.ImageSpec{
+		Repo:            DefaultImageRepo,
+		ProductVersion:  DefaultImageProductVersion,
+		KubedoopVersion: DefaultImageKubedoopVersion,
+	}
+}

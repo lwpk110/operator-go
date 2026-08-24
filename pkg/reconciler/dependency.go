@@ -22,7 +22,6 @@ import (
 	"net/url"
 	"strings"
 
-	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	databasev1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/database/v1alpha1"
 	s3v1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/s3/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +29,31 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// DependencyKind identifies the kind of an external object a cluster CR depends on.
+type DependencyKind string
+
+const (
+	// DependencyConfigMap is a ConfigMap the CR references but does not create.
+	DependencyConfigMap DependencyKind = "ConfigMap"
+	// DependencySecret is a Secret the CR references but does not create.
+	DependencySecret DependencyKind = "Secret"
+)
+
+// Dependency identifies one external object whose existence GenericReconciler verifies before
+// reconciling any role. Products declare them through GenericReconcilerConfig.Dependencies,
+// which is the only place the traversal of a product-specific spec can live: the generic spec
+// has no field describing where a product hides its references.
+//
+// An empty Namespace means the cluster CR's own namespace.
+type Dependency struct {
+	// Kind selects the object type to look up (ConfigMap or Secret).
+	Kind DependencyKind
+	// Namespace of the object; empty means the CR's namespace.
+	Namespace string
+	// Name of the object; must not be empty.
+	Name string
+}
 
 // DependencyResolver validates external dependencies.
 type DependencyResolver struct {
@@ -41,25 +65,17 @@ func NewDependencyResolver(client client.Client) *DependencyResolver {
 	return &DependencyResolver{Client: client}
 }
 
-// Validate checks if all dependencies are available.
-func (d *DependencyResolver) Validate(ctx context.Context, spec interface{}) error {
-	if genericSpec, ok := spec.(*commonsv1alpha1.GenericClusterSpec); ok && genericSpec != nil {
-		if genericSpec.ClusterOperation != nil {
-			if genericSpec.ClusterOperation.ReconciliationPaused {
-				return &DependencyError{
-					Type:    "ReconciliationPaused",
-					Message: "Reconciliation is paused",
-				}
-			}
-			if genericSpec.ClusterOperation.Stopped {
-				return &DependencyError{
-					Type:    "Stopped",
-					Message: "Cluster is stopped",
-				}
-			}
-		}
-	}
-
+// Validate is a no-op kept for backward compatibility with operators that call it directly.
+//
+// The reconcile flow no longer routes through it: dependency checking is declarative and
+// opt-in through GenericReconcilerConfig.Dependencies, which yields []Dependency and is
+// dispatched to ValidateConfigMap / ValidateSecret. Richer, product-shaped checks
+// (ValidateS3Connection, ValidateDatabaseConnection, ValidateZKConfig) remain explicit calls,
+// because only the product knows where those specs live.
+//
+// It also does NOT evaluate ClusterOperation pause/stop: those flags are handled at the very top
+// of the reconcile loop (GenericReconciler.reconcile), before any resource mutation.
+func (d *DependencyResolver) Validate(_ context.Context, _ interface{}) error {
 	return nil
 }
 

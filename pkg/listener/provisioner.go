@@ -25,20 +25,18 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-// ListenerProvisioner manages listener service and volume declarations.
-// It provides a unified interface for registering service and CSI volume needs,
+// ListenerProvisioner manages listener CSI volume declarations.
+// It provides a unified interface for registering CSI volume needs,
 // then materializing them as Kubernetes resources.
 //
 // Primary integration methods:
-//   - Services(), Volumes(), VolumeMounts() for direct resource construction
+//   - Volumes(), VolumeMounts() for direct resource construction
 //   - Path() and MustPath() for config generation (mount path lookup)
 //
 // Convenience method:
 //   - AutoInject() for operators using StatefulSetBuilder
 type ListenerProvisioner struct {
-	serviceRegs   []*ServiceRegistration
 	volumeRegs    []*VolumeRegistration
-	serviceNames  map[string]struct{}
 	volumeNames   map[string]struct{}
 	mountBasePath string
 }
@@ -47,70 +45,43 @@ type ListenerProvisioner struct {
 func NewProvisioner() *ListenerProvisioner {
 	return &ListenerProvisioner{
 		mountBasePath: constant.KubedoopListenerDir,
-		serviceNames:  make(map[string]struct{}),
 		volumeNames:   make(map[string]struct{}),
 	}
 }
 
-// WithMountBasePath overrides the default mount base path.
+// WithMountBasePath overrides the default mount base path. An empty path leaves the default
+// (constant.KubedoopListenerDir) in place. The path must be absolute: a relative base would
+// compose into a relative container mountPath, which the API server rejects.
 func (p *ListenerProvisioner) WithMountBasePath(basePath string) *ListenerProvisioner {
-	if basePath != "" {
-		p.mountBasePath = path.Clean(basePath)
+	if basePath == "" {
+		return p
 	}
-	return p
-}
-
-// RegisterService adds service declarations to the provisioner.
-// Panics if a service with the same name is already registered, or if a headless
-// service name would collide with its auto-generated headless name (name + "-headless").
-func (p *ListenerProvisioner) RegisterService(registrations ...*ServiceRegistration) *ListenerProvisioner {
-	for _, reg := range registrations {
-		if _, exists := p.serviceNames[reg.name]; exists {
-			panic(fmt.Sprintf("listener service %q is already registered", reg.name))
-		}
-		p.serviceNames[reg.name] = struct{}{}
-		if reg.headless {
-			headlessName := reg.name + "-headless"
-			if _, exists := p.serviceNames[headlessName]; exists {
-				panic(fmt.Sprintf("listener service %q collides with existing headless service name", reg.name))
-			}
-			p.serviceNames[headlessName] = struct{}{}
-		}
-		p.serviceRegs = append(p.serviceRegs, reg)
+	if !path.IsAbs(basePath) {
+		panic(fmt.Sprintf("listener mount base path %q must be absolute", basePath))
 	}
+	p.mountBasePath = path.Clean(basePath)
 	return p
 }
 
 // RegisterVolume adds CSI volume declarations to the provisioner.
-// Panics if a volume with the same name is already registered.
+// Panics if a volume with the same name is already registered, or if a
+// registration has neither a listener class nor a listener name — such a
+// registration gives the CSI provisioner nothing to provision from.
 func (p *ListenerProvisioner) RegisterVolume(registrations ...*VolumeRegistration) *ListenerProvisioner {
 	for _, reg := range registrations {
+		if reg == nil {
+			panic("listener volume registration must not be nil")
+		}
 		if _, exists := p.volumeNames[reg.volumeName]; exists {
 			panic(fmt.Sprintf("listener volume %q is already registered", reg.volumeName))
+		}
+		if reg.listenerClass == "" && reg.listenerName == "" {
+			panic(fmt.Sprintf("listener volume %q must set a listener class or a listener name", reg.volumeName))
 		}
 		p.volumeNames[reg.volumeName] = struct{}{}
 		p.volumeRegs = append(p.volumeRegs, reg)
 	}
 	return p
-}
-
-// Services returns all registered services for the given namespace.
-// Panics if namespace is empty.
-// For each ServiceRegistration with headless enabled, returns both the regular
-// service and a headless variant (ClusterIP: None, name suffixed with "-headless").
-func (p *ListenerProvisioner) Services(namespace string) []*corev1.Service {
-	if namespace == "" {
-		panic("namespace is required for Services()")
-	}
-
-	var services []*corev1.Service
-	for _, reg := range p.serviceRegs {
-		services = append(services, reg.buildService(namespace))
-		if reg.headless {
-			services = append(services, reg.buildHeadlessService(namespace))
-		}
-	}
-	return services
 }
 
 // Volumes returns all registered CSI volumes for manual StatefulSet injection.
@@ -138,7 +109,6 @@ func (p *ListenerProvisioner) VolumeMounts() []corev1.VolumeMount {
 
 // AutoInject adds all registered volumes and mounts to a StatefulSetBuilder.
 // This is a convenience method for operators that use StatefulSetBuilder.
-// Services are NOT injected -- they are separate K8s resources applied by the reconciler.
 func (p *ListenerProvisioner) AutoInject(stsBuilder *builder.StatefulSetBuilder) {
 	for _, vol := range p.Volumes() {
 		stsBuilder.AddVolume(vol)

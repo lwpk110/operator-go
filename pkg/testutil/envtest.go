@@ -26,8 +26,10 @@ import (
 
 	"github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -142,9 +144,23 @@ func (e *TestEnv) Start() error {
 		return fmt.Errorf("failed to add appsv1 to scheme: %w", err)
 	}
 
+	// batch/v1 is not a kind the framework builds, but RoleGroupResources.ExtraResources accepts
+	// arbitrary GVKs and a Job is the one downstream products actually ship there. Without it the
+	// suite cannot reach the API server for that path at all.
+	if err := batchv1.AddToScheme(e.Scheme); err != nil {
+		panic(fmt.Sprintf("failed to add batch/v1 to scheme: %v", err))
+	}
+
 	if err := policyv1.AddToScheme(e.Scheme); err != nil {
 		_ = e.Env.Stop()
 		return fmt.Errorf("failed to add policyv1 to scheme: %w", err)
+	}
+
+	// rbacv1 is needed by GenericReconcilerConfig.WorkloadRBACRules, which makes the reconciler
+	// write a Role and RoleBinding.
+	if err := rbacv1.AddToScheme(e.Scheme); err != nil {
+		_ = e.Env.Stop()
+		return fmt.Errorf("failed to add rbacv1 to scheme: %w", err)
 	}
 
 	// Add project-specific types to scheme

@@ -17,15 +17,19 @@ limitations under the License.
 package vector
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/zncdatadev/operator-go/pkg/productlogging"
 )
 
 func defaultConfigData() VectorConfigData {
 	return VectorConfigData{
-		LogDir:            "/var/log/app",
+		LogDir:            "/kubedoop/log/",
 		AggregatorAddress: "vector-aggregator:9000",
 		Namespace:         "default",
 		ClusterName:       "test-cluster",
@@ -43,7 +47,7 @@ func TestRenderVectorConfig(t *testing.T) {
 		{
 			name:     "default config",
 			data:     defaultConfigData(),
-			contains: []string{"/var/log/app", "vector-aggregator:9000", "default", "test-cluster", "worker", "default"},
+			contains: []string{"/kubedoop/log/", "vector-aggregator:9000", "default", "test-cluster", "worker", "default"},
 		},
 		{
 			name: "custom aggregator address",
@@ -58,10 +62,10 @@ func TestRenderVectorConfig(t *testing.T) {
 			name: "custom log directory",
 			data: func() VectorConfigData {
 				d := defaultConfigData()
-				d.LogDir = "/custom/logs"
+				d.LogDir = "/custom/logs/"
 				return d
 			}(),
-			contains: []string{"/custom/logs"},
+			contains: []string{"/custom/logs/"},
 		},
 		{
 			name: "custom namespace and cluster",
@@ -90,6 +94,165 @@ func TestRenderVectorConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRenderVectorConfig_LogDirTrailingSlash asserts that a LogDir without a trailing slash
+// is normalized: the stable per-container globs are composed as "<LogDir>*/*.<suffix>".
+func TestRenderVectorConfig_LogDirTrailingSlash(t *testing.T) {
+	data := defaultConfigData()
+	data.LogDir = "/var/log/app" // no trailing slash
+	result, err := RenderVectorConfig(data)
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+	if !strings.Contains(result, "/var/log/app/*/*.stdout.log") {
+		t.Errorf("RenderVectorConfig() missing normalized per-container glob, got:\n%s", result)
+	}
+	if strings.Contains(result, "/var/log/app*/") {
+		t.Errorf("RenderVectorConfig() rendered an unnormalized glob (missing slash)")
+	}
+}
+
+// TestRenderVectorConfig_EscapesInterpolatedValues asserts that a value carrying a quote or a
+// line break stays inside its scalar: unescaped, it would close the YAML string (or the VRL
+// statement) and emit a config Vector cannot load.
+func TestRenderVectorConfig_EscapesInterpolatedValues(t *testing.T) {
+	data := defaultConfigData()
+	data.AggregatorAddress = "agg\":9000\nplayground: true"
+	data.Namespace = `ns"; .injected = "yes`
+	data.ClusterName = "cluster\nname"
+	data.RoleName = `role\path`
+
+	result, err := RenderVectorConfig(data)
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+
+	checks := []string{
+		`address: "agg\":9000\nplayground: true"`,
+		`.namespace = "ns\"; .injected = \"yes"`,
+		`.cluster = "cluster\nname"`,
+		`.role = "role\\path"`,
+	}
+	for _, check := range checks {
+		if !strings.Contains(result, check) {
+			t.Errorf("RenderVectorConfig() missing escaped value %q, got:\n%s", check, result)
+		}
+	}
+
+	// Every rendered line must still belong to the document: an unescaped break would have
+	// produced a top-level "playground: true" line of its own.
+	for _, line := range strings.Split(result, "\n") {
+		if line == "playground: true" {
+			t.Error("RenderVectorConfig() let an interpolated value escape into a config line")
+		}
+	}
+}
+
+// TestRenderVectorConfig_RejectsUnquotableLogDir asserts LogDir is refused rather than emitted
+// into the source globs and the VRL raw-string regex, neither of which can escape these.
+func TestRenderVectorConfig_RejectsUnquotableLogDir(t *testing.T) {
+	for _, logDir := range []string{"/var/log\n", "/var/'log'/", `/var/"log"/`} {
+		data := defaultConfigData()
+		data.LogDir = logDir
+		if _, err := RenderVectorConfig(data); err == nil {
+			t.Errorf("RenderVectorConfig() expected error for LogDir %q, got nil", logDir)
+		}
+	}
+}
+
+// TestRenderVectorConfig_RegexQuotesLogDir asserts the container/file extraction regex treats
+// LogDir literally: an unquoted metacharacter would widen the match beyond the log directory.
+func TestRenderVectorConfig_RegexQuotesLogDir(t *testing.T) {
+	data := defaultConfigData()
+	data.LogDir = "/var/log.d/"
+
+	result, err := RenderVectorConfig(data)
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+
+	want := `parse_regex!(.file, r'^/var/log\.d/(?P<container>.*?)/(?P<file>.*?)$')`
+	if !strings.Contains(result, want) {
+		t.Errorf("RenderVectorConfig() missing regex-quoted LogDir %q, got:\n%s", want, result)
+	}
+}
+
+// TestRenderVectorConfig_SourceGlobsMatchLogFileSuffixes is the guard that keeps the collector
+// and the producers in sync: the file appenders name their files from
+// productlogging.LogFileSuffix, so every framework productlogging can render must have a source
+// glob for that exact suffix. The list is productlogging's own enumeration rather than a copy of
+// it, so a framework registered there without a source here fails this test instead of silently
+// shipping no logs for it.
+func TestRenderVectorConfig_SourceGlobsMatchLogFileSuffixes(t *testing.T) {
+	result, err := RenderVectorConfig(defaultConfigData())
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+
+	frameworks := productlogging.SupportedLoggingFrameworks()
+	if len(frameworks) == 0 {
+		t.Fatal("productlogging.SupportedLoggingFrameworks() is empty")
+	}
+	for _, framework := range frameworks {
+		suffix := productlogging.LogFileSuffix(framework)
+		if suffix == "" {
+			t.Fatalf("productlogging.LogFileSuffix(%q) is empty", framework)
+		}
+		glob := "/kubedoop/log/*/*" + suffix
+		if !strings.Contains(result, glob) {
+			t.Errorf("RenderVectorConfig() has no source glob %q for framework %q", glob, framework)
+		}
+	}
+}
+
+// TestRenderVectorConfig_SourceGlobsAreExactlyKnownLogFileSuffixes pins the two lists to each other
+// in BOTH directions, which its sibling above does not: that one only asserts every framework this
+// package can render has a glob.
+//
+// The other direction is the one that broke. productlogging.KnownLogFileSuffixes is what
+// ValidateProducers rejects a product-rendered log file against, and it was derived from the
+// GENERATOR registry — so it answered "can this package render it" rather than "does the pipeline
+// collect it", and hard-failed the reconcile for `.stdout.log`, `.stderr.log` and `.airlift.json`,
+// all three of which this template globs and edge-parses. Those are precisely the files a product
+// that renders its own logging config writes, which is the seam the check exists to serve.
+//
+// pkg/productlogging cannot import pkg/vector (the dependency runs the other way), so this test is
+// where the coupling is enforced: adding a source here without adding its suffix there — or the
+// reverse — fails.
+func TestRenderVectorConfig_SourceGlobsAreExactlyKnownLogFileSuffixes(t *testing.T) {
+	result, err := RenderVectorConfig(defaultConfigData())
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+
+	globPattern := regexp.MustCompile(`- /kubedoop/log/\*/\*(\S+)`)
+	rendered := make(map[string]struct{})
+	for _, match := range globPattern.FindAllStringSubmatch(result, -1) {
+		rendered[match[1]] = struct{}{}
+	}
+	if len(rendered) == 0 {
+		t.Fatal("no source globs found in the rendered config; the glob shape changed")
+	}
+
+	known := make(map[string]struct{})
+	for _, suffix := range productlogging.KnownLogFileSuffixes() {
+		known[suffix] = struct{}{}
+	}
+
+	for suffix := range rendered {
+		if _, ok := known[suffix]; !ok {
+			t.Errorf("the pipeline collects %q but productlogging.KnownLogFileSuffixes() omits it: "+
+				"ValidateProducers would reject a product-rendered log file that Vector does collect",
+				suffix)
+		}
+	}
+	for suffix := range known {
+		if _, ok := rendered[suffix]; !ok {
+			t.Errorf("productlogging.KnownLogFileSuffixes() permits %q but no source globs it: "+
+				"ValidateProducers would accept a log file nothing collects", suffix)
+		}
 	}
 }
 
@@ -136,6 +299,21 @@ func TestRenderVectorConfig_ContainsAllSources(t *testing.T) {
 			t.Errorf("RenderVectorConfig() missing source %q", source)
 		}
 	}
+
+	// The per-container globs of the stable pipeline ("<LogDir>*/*.<suffix>").
+	expectedGlobs := []string{
+		"/kubedoop/log/*/*.stdout.log",
+		"/kubedoop/log/*/*.stderr.log",
+		"/kubedoop/log/*/*.log4j.xml",
+		"/kubedoop/log/*/*.log4j2.xml",
+		"/kubedoop/log/*/*.py.json",
+		"/kubedoop/log/*/*.airlift.json",
+	}
+	for _, glob := range expectedGlobs {
+		if !strings.Contains(result, glob) {
+			t.Errorf("RenderVectorConfig() missing per-container glob %q", glob)
+		}
+	}
 }
 
 func TestRenderVectorConfig_ContainsAllTransforms(t *testing.T) {
@@ -146,18 +324,54 @@ func TestRenderVectorConfig_ContainsAllTransforms(t *testing.T) {
 	}
 
 	expectedTransforms := []string{
-		"parse_stdout",
-		"parse_stderr",
-		"parse_log4j",
-		"parse_log4j2",
-		"parse_py",
-		"parse_airlift",
-		"enrich_metadata",
+		"processed_files_stdout",
+		"processed_files_stderr",
+		"processed_files_log4j",
+		"processed_files_log4j2",
+		"processed_files_py",
+		"processed_files_airlift",
+		"extended_logs_files",
+		"extended_logs",
 	}
 
 	for _, transform := range expectedTransforms {
 		if !strings.Contains(result, transform+":") {
 			t.Errorf("RenderVectorConfig() missing transform %q", transform)
+		}
+	}
+}
+
+// TestRenderVectorConfig_EdgeParsing asserts the stable edge-parsing semantics survive
+// rendering: structured parsing of log4j/log4j2/py events, container/file extraction, and
+// the normalized event schema fields.
+func TestRenderVectorConfig_EdgeParsing(t *testing.T) {
+	data := defaultConfigData()
+	result, err := RenderVectorConfig(data)
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+
+	checks := []string{
+		// log4j XML edge parsing (namespace wrapper + XML parse).
+		`xmlns:log4j=\"http://jakarta.apache.org/log4j/\"`,
+		"parse_xml(wrapped_xml_event)",
+		// log4j2 Instant/timeMillis handling.
+		"instant.@epochSecond",
+		"event.@timeMillis",
+		// python JSON parsing.
+		"parse_json(raw_message)",
+		`parse_timestamp(asctime, "%F %T,%3f")`,
+		// container/file extraction from the source path.
+		"parse_regex!(.file, r'^/kubedoop/log/(?P<container>.*?)/(?P<file>.*?)$')",
+		"del(.source_type)",
+		// stable host key.
+		`host_key: "pod"`,
+		// data dir matches the sidecar data volume mount.
+		"data_dir: /kubedoop/vector/var",
+	}
+	for _, check := range checks {
+		if !strings.Contains(result, check) {
+			t.Errorf("RenderVectorConfig() missing stable pipeline fragment %q", check)
 		}
 	}
 }
@@ -172,8 +386,11 @@ func TestRenderVectorConfig_ContainsSink(t *testing.T) {
 	if !strings.Contains(result, "aggregator:") {
 		t.Error("RenderVectorConfig() missing aggregator sink")
 	}
-	if !strings.Contains(result, `type: "vector"`) {
+	if !strings.Contains(result, "type: vector") {
 		t.Error("RenderVectorConfig() missing vector sink type")
+	}
+	if !strings.Contains(result, "- extended_logs") {
+		t.Error("RenderVectorConfig() aggregator sink should consume extended_logs")
 	}
 }
 
@@ -187,14 +404,50 @@ func TestRenderVectorConfig_APIDefaults(t *testing.T) {
 	if !strings.Contains(result, "enabled: true") {
 		t.Error("RenderVectorConfig() API should be enabled")
 	}
-	if !strings.Contains(result, "127.0.0.1:8686") {
-		t.Error("RenderVectorConfig() API address should be 127.0.0.1:8686")
+	// The wildcard bind is the framework's long-standing behaviour and is asserted here so a change
+	// to it is a deliberate, visible decision rather than a side effect of something else. It is a
+	// departure from Vector's own defaults (api.enabled false, api.address 127.0.0.1:8686) and the
+	// API is unauthenticated GraphQL that `vector tap` streams event payloads over, so whether to
+	// keep exposing it belongs to a security review of this endpoint — not to probe placement, which
+	// is what introduced the wildcard in the first place.
+	if !strings.Contains(result, "address: 0.0.0.0:8686") {
+		t.Error("RenderVectorConfig() API address should be 0.0.0.0:8686")
+	}
+	if !strings.Contains(result, "playground: false") {
+		t.Error("RenderVectorConfig() API playground should be disabled")
+	}
+}
+
+// TestRenderVectorConfig_SelfMetrics guards the agent's own observability: it is the only thing that
+// makes "the agent stopped shipping" detectable, since the pipeline's other sink is the aggregator it
+// may have lost. It is also what the Vector container's liveness probe targets, because serving it
+// requires the topology to be running while the API's /health reports merely that the API is up.
+func TestRenderVectorConfig_SelfMetrics(t *testing.T) {
+	data := defaultConfigData()
+	result, err := RenderVectorConfig(data)
+	if err != nil {
+		t.Fatalf("RenderVectorConfig() error = %v", err)
+	}
+
+	for _, want := range []string{
+		"internal_metrics:\n    type: internal_metrics",
+		"type: prometheus_exporter",
+		fmt.Sprintf("address: 0.0.0.0:%d", VectorMetricsPort),
+	} {
+		if !strings.Contains(result, want) {
+			t.Errorf("RenderVectorConfig() missing %q; the liveness probe would have nothing to hit", want)
+		}
+	}
+	// Wired, not merely declared: a prometheus_exporter with no inputs serves an empty document
+	// and would still answer the probe, so this is the assertion that has content.
+	if !strings.Contains(result, "  metrics:\n    inputs:\n      - internal_metrics") {
+		t.Error("RenderVectorConfig() prometheus_exporter sink must take internal_metrics as input")
 	}
 }
 
 func TestRenderVectorConfig_MetadataEnrichment(t *testing.T) {
 	data := VectorConfigData{
-		LogDir:            "/var/log/app",
+		LogDir:            "/kubedoop/log/",
 		AggregatorAddress: "vector-aggregator:9000",
 		Namespace:         "my-namespace",
 		ClusterName:       "my-cluster",
@@ -206,19 +459,23 @@ func TestRenderVectorConfig_MetadataEnrichment(t *testing.T) {
 		t.Fatalf("RenderVectorConfig() error = %v", err)
 	}
 
+	// The stable schema stamps FLAT metadata fields (not nested under .tags).
 	metadataChecks := []struct {
 		key   string
 		value string
 	}{
-		{`tags.namespace = "my-namespace"`, "namespace"},
-		{`tags.cluster = "my-cluster"`, "cluster"},
-		{`tags.role = "server"`, "role"},
-		{`tags.role_group = "default"`, "role_group"},
+		{`.namespace = "my-namespace"`, "namespace"},
+		{`.cluster = "my-cluster"`, "cluster"},
+		{`.role = "server"`, "role"},
+		{`.roleGroup = "default"`, "roleGroup"},
 	}
 
 	for _, check := range metadataChecks {
 		if !strings.Contains(result, check.key) {
 			t.Errorf("RenderVectorConfig() missing metadata enrichment for %s: %q", check.value, check.key)
 		}
+	}
+	if strings.Contains(result, ".tags.") {
+		t.Error("RenderVectorConfig() must not nest metadata under .tags (stable schema is flat)")
 	}
 }

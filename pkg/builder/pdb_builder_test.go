@@ -22,6 +22,7 @@ import (
 	"github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/builder"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 )
 
 var _ = Describe("PDBBuilder", func() {
@@ -110,11 +111,32 @@ var _ = Describe("PDBBuilder", func() {
 		It("should build a PDB with custom maxUnavailable", func() {
 			max := intstr.FromInt(2)
 			pdb := pdbBuilder.
+				WithSelector(map[string]string{"app": "test-app"}).
 				WithMaxUnavailable(max).
 				Build()
 
 			Expect(pdb.Spec.MaxUnavailable).NotTo(BeNil())
 			Expect(*pdb.Spec.MaxUnavailable).To(Equal(max))
+		})
+
+		// An empty selector is the one invalid object in this package the API server accepts: it
+		// selects every pod in the namespace and blocks their voluntary eviction.
+		It("should panic when no selector was set", func() {
+			Expect(func() {
+				pdbBuilder.WithMaxUnavailable(intstr.FromInt(1)).Build()
+			}).To(PanicWith(ContainSubstring("empty selector matches every pod")))
+		})
+
+		It("should not share the maxUnavailable pointer with the builder", func() {
+			b := pdbBuilder.
+				WithSelector(map[string]string{"app": "test-app"}).
+				WithMaxUnavailable(intstr.FromInt(2))
+
+			first := b.Build()
+			*first.Spec.MaxUnavailable = intstr.FromInt(99)
+
+			second := b.Build()
+			Expect(*second.Spec.MaxUnavailable).To(Equal(intstr.FromInt(2)))
 		})
 	})
 
@@ -148,7 +170,7 @@ var _ = Describe("PDBBuilder", func() {
 
 		It("should set enabled from spec", func() {
 			spec := &v1alpha1.PodDisruptionBudgetSpec{
-				Enabled: false,
+				Enabled: ptr.To(false),
 			}
 			result := pdbBuilder.WithSpec(spec)
 
@@ -159,7 +181,7 @@ var _ = Describe("PDBBuilder", func() {
 		It("should set max unavailable from spec", func() {
 			maxUnavailable := int32(2)
 			spec := &v1alpha1.PodDisruptionBudgetSpec{
-				Enabled:        true,
+				Enabled:        ptr.To(true),
 				MaxUnavailable: &maxUnavailable,
 			}
 			result := pdbBuilder.WithSpec(spec)
@@ -171,7 +193,7 @@ var _ = Describe("PDBBuilder", func() {
 
 		It("should handle spec with nil max unavailable", func() {
 			spec := &v1alpha1.PodDisruptionBudgetSpec{
-				Enabled:        true,
+				Enabled:        ptr.To(true),
 				MaxUnavailable: nil,
 			}
 			result := pdbBuilder.WithSpec(spec)
@@ -183,7 +205,7 @@ var _ = Describe("PDBBuilder", func() {
 		It("should build PDB with spec values", func() {
 			maxUnavailable := int32(3)
 			spec := &v1alpha1.PodDisruptionBudgetSpec{
-				Enabled:        true,
+				Enabled:        ptr.To(true),
 				MaxUnavailable: &maxUnavailable,
 			}
 			pdb := pdbBuilder.
@@ -199,7 +221,7 @@ var _ = Describe("PDBBuilder", func() {
 		It("should combine WithSpec with other builders", func() {
 			maxUnavailable := int32(1)
 			spec := &v1alpha1.PodDisruptionBudgetSpec{
-				Enabled:        true,
+				Enabled:        ptr.To(true),
 				MaxUnavailable: &maxUnavailable,
 			}
 			pdb := pdbBuilder.

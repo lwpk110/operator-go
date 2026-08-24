@@ -32,12 +32,20 @@ type S3ConnectionSpec struct {
 	Credentials *commonsv1alpha1.Credentials `json:"credentials"`
 
 	// +kubebuilder:validation:Required
-	Host string `json:"host,omitempty"`
+	Host string `json:"host"`
 
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Minimum=0
 	Port int `json:"port,omitempty"`
 
+	// PathStyle selects the S3 addressing style: true addresses the bucket as a path
+	// (`https://<host>/<bucket>`), false as a virtual host (`https://<bucket>.<host>`).
+	//
+	// It defaults to false, which is right for AWS S3 and wrong for most self-hosted
+	// backends. MinIO in particular serves path-style only: with virtual-host addressing the
+	// client resolves `<bucket>.<host>` — e.g. `warehouse.minio` in-cluster — which does not
+	// exist in DNS. Nothing rejects that at admission; the pods start and fail on first access.
+	// Set `pathStyle: true` for MinIO, Ceph RGW and similar.
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:default:=false
 	PathStyle bool `json:"pathStyle,omitempty"`
@@ -56,8 +64,12 @@ type Tls struct {
 }
 
 type S3ConnectionStatus struct {
+	// +listType=map
+	// +listMapKey=type
+	// +patchStrategy=merge
+	// +patchMergeKey=type
 	// +kubebuilder:validation:Optional
-	Conditions []metav1.Condition `json:"condition,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
 // +kubebuilder:object:root=true
@@ -83,7 +95,7 @@ type S3ConnectionList struct {
 type S3BucketSpec struct {
 
 	// +kubebuilder:validation:Required
-	BucketName string `json:"bucketName,omitempty"`
+	BucketName string `json:"bucketName"`
 
 	// +kubebuilder:validation:Optional
 	Connection *S3BucketConnectionSpec `json:"connection,omitempty"`
@@ -98,8 +110,12 @@ type S3BucketConnectionSpec struct {
 }
 
 type S3BucketStatus struct {
+	// +listType=map
+	// +listMapKey=type
+	// +patchStrategy=merge
+	// +patchMergeKey=type
 	// +kubebuilder:validation:Optional
-	Conditions []metav1.Condition `json:"condition,omitempty"`
+	Conditions []metav1.Condition `json:"conditions,omitempty" patchStrategy:"merge" patchMergeKey:"type"`
 }
 
 // +kubebuilder:object:root=true

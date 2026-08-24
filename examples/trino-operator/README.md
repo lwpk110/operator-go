@@ -1,14 +1,24 @@
 # Trino Operator Example
 
-This is an example operator built with [Kubebuilder](https://book.kubebuilder.io/) and the [operator-go](../../) SDK. It demonstrates all core capabilities of the operator-go SDK.
+This is an example operator built with [Kubebuilder](https://book.kubebuilder.io/) and the
+[operator-go](../../) SDK. It demonstrates all core capabilities of the operator-go SDK.
 
 ## Features Demonstrated
 
-- **GenericReconciler Template Method Pattern**: The core reconciliation logic is handled by the SDK’s `GenericReconciler`, which calls product-specific handlers at appropriate points.
-- **RoleGroupHandler Product Logic Delegation**: Product-specific resource building is delegated to `TrinoRoleGroupHandler`, which routes to `CoordinatorsHandler` and `WorkersHandler`.
-- **Extension Mechanism**: Demonstrates `ClusterExtension` (CatalogExtension) and `RoleExtension` (HealthExtension) for lifecycle hooks.
-- **Builder Pattern**: K8s resources are built using a fluent builder pattern.
-- **Config Generation**: Trino configuration files (`config.properties`, `jvm.config`, catalog properties) are generated dynamically.
+- **GenericReconciler Template Method Pattern**: The reconciliation loop is owned by the SDK's
+  `GenericReconciler`, which calls product-specific seams at fixed points.
+- **BaseRoleGroupHandler Delegation**: `TrinoRoleGroupHandler` embeds
+  `reconciler.BaseRoleGroupHandler`, so the framework builds the ConfigMap, Services, StatefulSet
+  and role PDB; the override only appends what the merge pipeline cannot express.
+- **RoleGroupResolver**: `product.ComputeConfig` contributes Trino's `config.properties` as the
+  lowest-precedence merge layer, so any user `configOverrides` wins over it.
+- **Typed Extension Registry**: `common.NewExtensionRegistry[*TrinoCluster]()` holds
+  `ClusterExtension` (Catalog, Discovery) and `RoleExtension` (Health) hooks, each declaring
+  `*TrinoCluster` in its signatures.
+- **Admission Webhook**: a `CustomDefaulter` fills product defaults into the typed spec and a
+  `CustomValidator` rejects invalid clusters before they reach the reconciler.
+- **Declarative Logging**: `RoleDeclaration.LogProducers` lets the framework render the Log4j2 config from
+  the CRD logging spec.
 
 ## Project Structure
 
@@ -19,25 +29,34 @@ trino-operator/
 │   ├── groupversion_info.go         # Auto-generated
 │   └── zz_generated.deepcopy.go     # Auto-generated
 ├── cmd/
-│   └── main.go                      # Entry point with GenericReconciler setup
+│   └── main.go                      # Entry point: registry + GenericReconciler setup
 ├── config/
 │   ├── crd/                         # CRD YAMLs (auto-generated)
 │   ├── rbac/                        # RBAC configuration (auto-generated)
+│   ├── webhook/                     # Webhook configuration (auto-generated)
+│   ├── certmanager/                 # Serving certificates for the webhook
 │   ├── samples/                     # Sample CRs
-│   └── manager/                     # Manager configuration
+│   ├── manager/                     # Manager configuration
+│   └── default/                     # Kustomize overlay wiring all of the above
 ├── internal/
 │   ├── controller/
-│   │   └── trino_handler.go         # RoleGroupHandler implementation
-│   ├── handlers/
-│   │   ├── coordinators_handler.go  # Coordinators role handler
-│   │   └── workers_handler.go       # Workers role handler
+│   │   └── trino_handler.go         # RoleGroupHandler (embeds BaseRoleGroupHandler)
 │   ├── extensions/
 │   │   ├── catalog_extension.go     # ClusterExtension example
+│   │   ├── discovery_extension.go   # ClusterExtension + discovery ConfigMap example
 │   │   └── health_extension.go      # RoleExtension example
-│   └── config/
-│       ├── trino_config.go          # Trino config generation
-│       └── catalog_config.go        # Catalog config generation
-├── e2e/                             # E2E tests
+│   ├── product/
+│   │   └── config.go                # RoleGroupResolver and role name constants
+│   ├── config/
+│   │   ├── trino_config.go          # jvm.config generation
+│   │   └── catalog_config.go        # Catalog properties generation
+│   ├── constants/
+│   │   └── constants.go             # Image, port and container name constants
+│   └── webhook/v1alpha1/
+│       └── trinocluster_webhook.go  # Defaulter and validator
+├── test/
+│   ├── e2e/                         # E2E tests (build tag `e2e`)
+│   └── utils/                       # E2E helpers
 ├── Dockerfile                       # Container image
 ├── Makefile                         # Build targets
 └── README.md                        # This file
@@ -47,12 +66,19 @@ trino-operator/
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+ (see `go.mod`)
 - Docker
 - kubectl
 - Access to a Kubernetes cluster
+- [cert-manager](https://cert-manager.io/) in the cluster — the default overlay deploys the
+  admission webhook and takes its serving certificate from cert-manager
 
 ### Build and Run Locally
+
+`main.go` always registers the admission webhook, so the manager needs a serving certificate even
+when run from the host — the webhook server fails to start without one. Either point
+`--webhook-cert-path` at a directory holding `tls.crt`/`tls.key`, or place them in
+controller-runtime's default directory, `<temp-dir>/k8s-webhook-server/serving-certs`.
 
 ```bash
 # Install CRDs into the cluster
@@ -81,8 +107,11 @@ make deploy IMG=trino-operator:latest
 ### Run Tests
 
 ```bash
-# Run unit tests
+# Run unit and envtest suites
 make test
+
+# Run the e2e suite against a Kind cluster
+make test-e2e
 ```
 
 ## Architecture
@@ -93,41 +122,58 @@ make test
 ┌─────────────────────────────────────────────────────────────────┐
 │                     GenericReconciler                           │
 ├─────────────────────────────────────────────────────────────────┤
-│ 1. Fetch CR                                                     │
-│ 2. Execute PreReconcile extensions                              │
-│ 3. Validate dependencies                                        │
-│ 4. For each Role:                                               │
+│ 1. Fetch CR, record observedGeneration                          │
+│ 2. ClusterOperation gate (reconciliationPaused returns here)    │
+│ 3. Ensure workload ServiceAccount (always; name derived from CR)│
+│ 3b. Ensure workload RBAC (only when WorkloadRBACRules is set)   │
+│ 4. Execute Cluster PreReconcile extensions                      │
+│ 5. Validate dependencies                                        │
+│ 6. For each Role (sorted by name):                              │
 │    a. Execute Role PreReconcile extensions                      │
 │    b. For each RoleGroup:                                       │
 │       - Execute RoleGroup PreReconcile extensions               │
-│       - Build RoleGroupBuildContext                             │
+│       - Build RoleGroupBuildContext (merged config + sidecars)  │
 │       - Delegate to RoleGroupHandler.BuildResources()           │
-│       - Apply resources (CM → HeadlessSvc → Service → STS → PDB)│
+│       - Apply CM → HeadlessSvc → Svc → extras → STS → PDB       │
 │       - Execute RoleGroup PostReconcile extensions              │
-│    c. Execute Role PostReconcile extensions                     │
-│ 5. Cleanup orphaned resources                                   │
-│ 6. Update health status                                         │
-│ 7. Execute PostReconcile extensions                             │
-│ 8. Update status                                                │
+│    c. Reconcile the role-level PodDisruptionBudget              │
+│    d. Execute Role PostReconcile extensions                     │
+│ 7. Cleanup orphaned resources                                   │
+│ 8. Update health status                                         │
+│ 9. Execute Cluster PostReconcile extensions                     │
+│ 10. Write status and schedule the next wakeup                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### RoleGroupHandler Routing
+A failure anywhere in this flow runs the `OnReconcileError` extensions and maps to the `Degraded`
+condition on the CR. API-server rate limiting is the exception: it backs off and retries without
+marking the cluster degraded.
+
+### Resource Building Split
 
 ```text
-TrinoRoleGroupHandler.BuildResources()
+GenericReconciler
     │
-    ├── RoleCoordinators → CoordinatorsHandler.BuildResources()
-    │                           ├── buildConfigMap()
-    │                           ├── buildHeadlessService()
-    │                           ├── buildService()
-    │                           └── buildStatefulSet()
+    ├── per role group: TrinoRoleGroupHandler.BuildResources()
+    │       │
+    │       ├── BaseRoleGroupHandler.BuildResources()   # the framework's 90%
+    │       │       ├── ConfigMap (merged config + Log4j2 logging file)
+    │       │       ├── Headless Service + Service
+    │       │       └── StatefulSet (image, sidecars, podOverrides)
+    │       │
+    │       └── product-specific additions
+    │               ├── jvm.config            (both roles)
+    │               └── catalog/*.properties  (coordinators only)
     │
-    └── RoleWorkers → WorkersHandler.BuildResources()
-                          ├── buildConfigMap()
-                          ├── buildHeadlessService()
-                          └── buildStatefulSet()
+    └── per role: BaseRoleGroupHandler.BuildRolePodDisruptionBudget()
 ```
+
+The PDB is deliberately outside `BuildResources`: `roleConfig.podDisruptionBudget` covers all
+pods of a role across every role group, so the framework builds exactly one per role instead of
+one per group.
+
+Both roles share one handler; the role is read from `buildCtx.RoleName` rather than routed to
+separate handler types.
 
 ## CRD Example
 
@@ -146,6 +192,7 @@ spec:
       default:
         replicas: 1
         config:
+          gracefulShutdownTimeout: "30s"
           resources:
             cpu:
               min: "500m"
@@ -174,14 +221,19 @@ spec:
       type: tpch
 ```
 
+See `config/samples/trino_v1alpha1_trinocluster.yaml` for the full sample.
+
 ## Key Integration Points
 
 ### 1. Implementing ClusterInterface
 
+`ClusterInterface` has two methods. Everything else the SDK needs — metadata accessors, object
+kind, `DeepCopyObject` — comes from the embedded `TypeMeta`/`ObjectMeta` and the generated
+deep-copy code.
+
 ```go
-// TrinoCluster implements ClusterInterface.
-// GetSpec builds GenericClusterSpec dynamically from the typed coordinators/workers
-// fields, bridging the type-safe CRD structure to the SDK framework's generic Roles map.
+// GetSpec builds a GenericClusterSpec from the typed coordinators/workers fields, bridging the
+// type-safe CRD structure to the SDK's generic Roles map without a redundant spec.roles field.
 func (t *TrinoCluster) GetSpec() *commonsv1alpha1.GenericClusterSpec {
     roles := make(map[string]commonsv1alpha1.RoleSpec)
     if t.Spec.Coordinators != nil {
@@ -191,49 +243,163 @@ func (t *TrinoCluster) GetSpec() *commonsv1alpha1.GenericClusterSpec {
         roles["workers"] = t.Spec.Workers.RoleSpec
     }
     return &commonsv1alpha1.GenericClusterSpec{
+        Image:            t.Spec.Image,
         ClusterOperation: t.Spec.ClusterOperation,
         Roles:            roles,
     }
 }
 
+// GetStatus returns a pointer into the CR, so product-specific status fields survive a
+// reconcile cycle untouched. There is no SetStatus: the framework mutates through this pointer.
 func (t *TrinoCluster) GetStatus() *commonsv1alpha1.GenericClusterStatus {
     return &t.Status.GenericClusterStatus
 }
-
-func (t *TrinoCluster) SetStatus(status *commonsv1alpha1.GenericClusterStatus) {
-    t.Status.GenericClusterStatus = *status
-}
 ```
+
+Optional seams are separate interfaces the CR may also satisfy — `TrinoCluster` implements
+`reconciler.VectorAggregatorProvider` so the framework owns `vector.yaml` generation.
 
 ### 2. Implementing RoleGroupHandler
 
 ```go
-// TrinoRoleGroupHandler implements RoleGroupHandler
+// TrinoRoleGroupHandler embeds the SDK handler, so the framework builds the bulk of the
+// resources and the override only appends what the merge pipeline cannot express.
+type TrinoRoleGroupHandler struct {
+    *reconciler.BaseRoleGroupHandler[*trinov1alpha1.TrinoCluster]
+}
+
 func (h *TrinoRoleGroupHandler) BuildResources(
     ctx context.Context,
     k8sClient client.Client,
     cr *trinov1alpha1.TrinoCluster,
     buildCtx *reconciler.RoleGroupBuildContext,
 ) (*reconciler.RoleGroupResources, error) {
-    // Route to role-specific handlers
-    switch buildCtx.RoleName {
-    case RoleCoordinators:
-        return h.coordinatorsHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
-    case RoleWorkers:
-        return h.workersHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
+    resources, err := h.BaseRoleGroupHandler.BuildResources(ctx, k8sClient, cr, buildCtx)
+    if err != nil {
+        return nil, err
     }
+
+    if resources.ConfigMap != nil {
+        // setIfAbsent never clobbers a key the merge pipeline already produced (CRD always wins).
+        setIfAbsent(resources.ConfigMap.Data, "jvm.config", func() string { return jvmConfig(buildCtx.RoleName) })
+
+        if buildCtx.RoleName == product.RoleCoordinators {
+            // ... catalog/<name>.properties, coordinator only
+        }
+    }
+
+    return resources, nil
 }
 ```
 
-### 3. Registering Extensions
+`NewTrinoRoleGroupHandler(scheme)` configures only what a role cannot differ on
+(`ConfigGenerator`, `ConfigMountPath`). Everything role-shaped — primary container name, container
+and service ports, log producers — is stated by `DeclareRoles`, which implements
+`reconciler.RoleProvider` and receives the cr, so a port that moves because the CR enabled TLS is
+computed there rather than written into handler state the next cluster inherits.
+
+### 3. Deriving Config from the Effective Config
+
+```go
+// ComputeConfig is merged as the LOWEST layer (product < role < role group), so a user's
+// configOverrides always win over it. It runs once per role group, AFTER the typed config
+// block has been folded — so it can read rg.EffectiveConfig() — and before anything is built.
+// It is recomputed every reconcile and may derive from live cluster state; here, the discovery
+// URI of the coordinator Service.
+func ComputeConfig(
+    _ context.Context, _ client.Client, cr *trinov1alpha1.TrinoCluster,
+    rg *reconciler.RoleGroupBuildContext,
+) (*reconciler.Contribution, error) {
+    port := CoordinatorPort(cr)
+
+    props := map[string]string{
+        "http-server.http.port": fmt.Sprintf("%d", port),
+        "discovery.uri":         discoveryURI(cr, port),
+    }
+    switch rg.RoleName {
+    case RoleCoordinators:
+        props["coordinator"] = "true"
+        props["node-scheduler.include-coordinator"] = "false"
+        props["discovery-server.enabled"] = "true"
+    case RoleWorkers:
+        props["coordinator"] = "false"
+    }
+    return &reconciler.Contribution{
+        ConfigOverrides: map[string]map[string]string{
+            "config.properties": props,
+        },
+    }, nil
+}
+```
+
+### 4. Registering Extensions
+
+The registry is instantiated for the product's own CR type, which is what lets extensions
+declare `*TrinoCluster` in their hooks instead of the SDK's wide `ClusterInterface`. There is no
+process-global registry: a registry is handed to exactly one reconciler, and an operator that
+manages several CR types builds one registry per type.
 
 ```go
 // In main.go
-catalogExt := extensions.NewCatalogExtension()
-common.GetExtensionRegistry().RegisterClusterExtension(catalogExt)
+func newExtensionRegistry(scheme *runtime.Scheme) *common.ExtensionRegistry[*trinov1alpha1.TrinoCluster] {
+    registry := common.NewExtensionRegistry[*trinov1alpha1.TrinoCluster]()
 
-healthExt := extensions.NewHealthExtension()
-common.GetExtensionRegistry().RegisterRoleExtension(healthExt)
+    registry.RegisterClusterExtension(extensions.NewCatalogExtension())
+    registry.RegisterRoleExtension(extensions.NewHealthExtension())
+
+    // Priority (not registration order) is what keeps the discovery extension running after the
+    // catalog extension has refreshed the status.
+    registry.RegisterClusterExtension(extensions.NewDiscoveryExtension(scheme), common.WithPriority(common.PriorityLow))
+
+    return registry
+}
+```
+
+### 5. Wiring the GenericReconciler
+
+The registry only runs when it reaches the reconciler through `ExtensionRegistry`; without that
+field the hooks are never executed.
+
+```go
+// In main.go
+roleGroupHandler := trinocontroller.NewTrinoRoleGroupHandler(mgr.GetScheme())
+
+reconcilerCfg := &reconciler.GenericReconcilerConfig[*trinov1alpha1.TrinoCluster]{
+    Client: mgr.GetClient(),
+    // Uncached: refreshes the resourceVersion after a conflicting status write, which the
+    // informer cache is by definition too stale to serve.
+    APIReader:           mgr.GetAPIReader(),
+    Scheme:              mgr.GetScheme(),
+    Recorder:            mgr.GetEventRecorderFor("trino-cluster-controller"),
+    RoleGroupHandler:    roleGroupHandler,
+    // The same object declares this product's roles, once per pass with the cr in hand.
+    // Leaving it unset is legal and means the catalog is EMPTY: no role is rejected, but every
+    // role builds with a zero declaration — no ports, no container name, no Service, no log
+    // producers — and the reconcile reports success. Set it unless the handler builds everything.
+    RoleProvider:        roleGroupHandler,
+    RoleGroupResolver:   reconciler.RoleGroupResolverFunc[*trinov1alpha1.TrinoCluster](product.ComputeConfig),
+    // Read every reconcile, so an operator upgrade moves existing clusters onto the
+    // co-released product image — which a mutating webhook cannot do, since its defaults are
+    // persisted at admission and never recomputed.
+    ImageResolution: reconciler.ImageResolution{
+        ProductName: constants.ProductName,
+        Defaults:    constants.ImageDefaults(),
+    },
+    HealthCheckInterval: 120 * time.Second,
+    HealthCheckTimeout:  300 * time.Second,
+    Prototype:           &trinov1alpha1.TrinoCluster{},
+    ExtensionRegistry:   newExtensionRegistry(mgr.GetScheme()),
+}
+
+trinoReconciler, err := reconciler.NewGenericReconciler(reconcilerCfg)
+if err != nil {
+    setupLog.Error(err, "unable to create reconciler")
+    os.Exit(1)
+}
+if err := trinoReconciler.SetupWithManager(mgr); err != nil {
+    setupLog.Error(err, "unable to create controller", "controller", "TrinoCluster")
+    os.Exit(1)
+}
 ```
 
 ## License

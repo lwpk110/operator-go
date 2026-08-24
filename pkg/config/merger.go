@@ -18,6 +18,7 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
@@ -52,6 +53,20 @@ type MergedConfig struct {
 
 	// PodOverrides contains pod template overrides.
 	PodOverrides *corev1.PodTemplateSpec
+
+	// PodOverrideErrors collects the podOverrides layers that could not be applied: a layer
+	// whose raw JSON does not decode into a PodTemplateSpec, or a strategic merge patch that
+	// failed. Merge cannot reject the input (it has no error return), so it records the problem
+	// here instead of dropping the layer silently; callers are expected to surface a non-empty
+	// slice (Warning event / Degraded condition) rather than reconcile a pod the user did not
+	// ask for.
+	PodOverrideErrors []error
+
+	// Logging is the per-container logging configuration, deep-merged from the Role and
+	// RoleGroup levels (RoleGroup values win at the leaf). It drives both Vector sidecar
+	// enablement and per-container logging config file generation. Nil when the product
+	// CRD configured no logging.
+	Logging *v1alpha1.LoggingSpec
 }
 
 // NewMergedConfig creates a new MergedConfig with initialized maps.
@@ -66,7 +81,10 @@ func NewMergedConfig() *MergedConfig {
 
 // ConfigMerger merges role and role group configurations.
 type ConfigMerger struct {
-	// SliceMergeStrategy controls how slices are merged.
+	// SliceMergeStrategy controls how slices (CLI arguments) are merged. It is settable by the
+	// caller — the framework's own merger keeps the SDK default (MergeStrategyReplace), while a
+	// product that treats CLI arguments as additive can construct a merger with
+	// MergeStrategyAppend.
 	SliceMergeStrategy MergeStrategy
 }
 
@@ -77,42 +95,37 @@ func NewConfigMerger() *ConfigMerger {
 	}
 }
 
-// Merge performs deep merge of role and role group configurations.
-// RoleGroup configurations override Role configurations.
-func (m *ConfigMerger) Merge(roleOverrides, roleGroupOverrides *v1alpha1.OverridesSpec) *MergedConfig {
+// Merge performs a deep merge of the given override layers in increasing order of
+// precedence: each layer overrides the ones before it. The conventional order is
+// product defaults (lowest), then role overrides, then role group overrides (highest),
+// so a value set anywhere in the CRD always wins over a product default. nil layers are
+// skipped, so callers may pass an absent layer (e.g. a missing product default) without
+// a guard.
+//
+// Merge strategies follow the SDK contract: maps (config files, env) are deep-merged,
+// slices (CLI) follow SliceMergeStrategy, and pod overrides use a strategic merge patch.
+//
+// Passing exactly (roleOverrides, roleGroupOverrides) reproduces the previous two-layer
+// behavior, so existing callers are unaffected.
+//
+// A podOverrides layer that cannot be applied does not abort the merge (there is no error
+// return): the failure is recorded in MergedConfig.PodOverrideErrors for the caller to surface.
+func (m *ConfigMerger) Merge(overrides ...*v1alpha1.OverridesSpec) *MergedConfig {
 	result := NewMergedConfig()
 
-	// Normalize nil inputs
-	if roleOverrides == nil {
-		roleOverrides = &v1alpha1.OverridesSpec{}
+	for _, o := range overrides {
+		if o == nil {
+			continue
+		}
+		result.ConfigFiles = m.mergeConfigFiles(result.ConfigFiles, o.ConfigOverrides)
+		result.EnvVars = m.mergeMaps(result.EnvVars, o.EnvOverrides)
+		result.CliArgs = m.mergeSlices(result.CliArgs, o.CliOverrides)
+		merged, err := m.mergePodOverrideInto(result.PodOverrides, o.PodOverrides)
+		if err != nil {
+			result.PodOverrideErrors = append(result.PodOverrideErrors, err)
+		}
+		result.PodOverrides = merged
 	}
-	if roleGroupOverrides == nil {
-		roleGroupOverrides = &v1alpha1.OverridesSpec{}
-	}
-
-	// Merge config files (deep merge)
-	result.ConfigFiles = m.mergeConfigFiles(
-		roleOverrides.ConfigOverrides,
-		roleGroupOverrides.ConfigOverrides,
-	)
-
-	// Merge environment variables (deep merge)
-	result.EnvVars = m.mergeMaps(
-		roleOverrides.EnvOverrides,
-		roleGroupOverrides.EnvOverrides,
-	)
-
-	// Merge CLI arguments (replace or append)
-	result.CliArgs = m.mergeSlices(
-		roleOverrides.CliOverrides,
-		roleGroupOverrides.CliOverrides,
-	)
-
-	// Merge pod overrides (strategic merge patch)
-	result.PodOverrides = m.mergePodOverrides(
-		roleOverrides.PodOverrides,
-		roleGroupOverrides.PodOverrides,
-	)
 
 	return result
 }
@@ -161,6 +174,10 @@ func (m *ConfigMerger) mergeConfigFiles(base, override map[string]map[string]str
 }
 
 // mergeSlices merges two slices based on the merge strategy.
+//
+// An empty override (nil or []) is indistinguishable from an absent one: it leaves the base
+// untouched, so a role group cannot clear the CLI arguments its role set. Only a non-empty
+// override replaces (or, under MergeStrategyAppend, extends) them.
 func (m *ConfigMerger) mergeSlices(base, override []string) []string {
 	if len(override) == 0 {
 		return base
@@ -178,68 +195,76 @@ func (m *ConfigMerger) mergeSlices(base, override []string) []string {
 	}
 }
 
-// mergePodOverrides performs strategic merge patch on pod overrides.
-func (m *ConfigMerger) mergePodOverrides(base, override *k8sruntime.RawExtension) *corev1.PodTemplateSpec {
-	if base == nil && override == nil {
-		return nil
-	}
-
-	var basePod, overridePod corev1.PodTemplateSpec
-
-	// Parse base
-	if base != nil && base.Raw != nil {
-		if err := json.Unmarshal(base.Raw, &basePod); err != nil {
-			// Log error but continue
-			basePod = corev1.PodTemplateSpec{}
-		}
-	}
-
-	// Parse override
+// mergePodOverrideInto strategically merges a raw pod override layer on top of an
+// already-parsed base template, returning the merged result. This fold-friendly shape lets
+// Merge accumulate any number of layers: the accumulator (base) is the running merged
+// template and override is the next raw layer.
+//
+// Behavior:
+//   - both empty            -> nil
+//   - only the override set -> the parsed override
+//   - only the base set     -> the base unchanged
+//   - both set              -> strategic merge patch of override onto base
+//
+// The returned error reports a layer that could not be applied. The template returned alongside
+// it is the best available fallback (the malformed layer is treated as absent, a failed patch
+// keeps the higher-precedence layer) so the fold can continue, but the caller must not treat
+// the result as the user's intent: a malformed override must neither win precedence nor
+// surface downstream as a non-nil empty PodTemplateSpec.
+func (m *ConfigMerger) mergePodOverrideInto(base *corev1.PodTemplateSpec, override *k8sruntime.RawExtension) (*corev1.PodTemplateSpec, error) {
+	// Parse the override layer. An unmarshal failure keeps the layer out of the result.
+	var overridePod *corev1.PodTemplateSpec
 	if override != nil && override.Raw != nil {
-		if err := json.Unmarshal(override.Raw, &overridePod); err != nil {
-			// Log error but continue
-			overridePod = corev1.PodTemplateSpec{}
+		var parsed corev1.PodTemplateSpec
+		if err := json.Unmarshal(override.Raw, &parsed); err != nil {
+			return base, fmt.Errorf("podOverrides layer is not a valid PodTemplateSpec: %w", err)
 		}
+		overridePod = &parsed
 	}
 
-	// If only one is set, return it
-	if base == nil || base.Raw == nil {
-		return &overridePod
-	}
-	if override == nil || override.Raw == nil {
-		return &basePod
+	return m.mergePodTemplates(base, overridePod)
+}
+
+// mergePodTemplates strategic-merges override onto base, for the RawExtension path above once it
+// has decoded its layer.
+func (m *ConfigMerger) mergePodTemplates(
+	base, overridePod *corev1.PodTemplateSpec,
+) (*corev1.PodTemplateSpec, error) {
+	switch {
+	case base == nil && overridePod == nil:
+		return nil, nil
+	case base == nil:
+		return overridePod, nil
+	case overridePod == nil:
+		return base, nil
 	}
 
-	// Perform strategic merge patch
-	baseBytes, err := json.Marshal(basePod)
+	baseBytes, err := json.Marshal(base)
 	if err != nil {
-		return &overridePod
+		return overridePod, fmt.Errorf("failed to encode the merged pod template: %w", err)
 	}
 
 	overrideBytes, err := json.Marshal(overridePod)
 	if err != nil {
-		return &basePod
+		return base, fmt.Errorf("failed to encode the podOverrides layer: %w", err)
 	}
 
-	// Get the pod template schema
-	podTemplateSchema, err := strategicpatch.NewPatchMetaFromStruct(basePod)
+	podTemplateSchema, err := strategicpatch.NewPatchMetaFromStruct(*base)
 	if err != nil {
-		// Fall back to simple override
-		return &overridePod
+		return overridePod, fmt.Errorf("failed to build the pod template patch metadata: %w", err)
 	}
 
-	// Perform the merge
 	mergedBytes, err := strategicpatch.StrategicMergePatchUsingLookupPatchMeta(baseBytes, overrideBytes, podTemplateSchema)
 	if err != nil {
-		return &overridePod
+		return overridePod, fmt.Errorf("failed to strategic-merge the podOverrides layer: %w", err)
 	}
 
 	var mergedPod corev1.PodTemplateSpec
 	if err := json.Unmarshal(mergedBytes, &mergedPod); err != nil {
-		return &overridePod
+		return overridePod, fmt.Errorf("failed to decode the strategic-merged pod template: %w", err)
 	}
 
-	return &mergedPod
+	return &mergedPod, nil
 }
 
 // Clone creates a deep copy of MergedConfig.
@@ -268,6 +293,7 @@ func (c *MergedConfig) Clone() *MergedConfig {
 
 	// Pod overrides are not cloned (reference copy is sufficient for most use cases)
 	result.PodOverrides = c.PodOverrides
+	result.PodOverrideErrors = append([]error(nil), c.PodOverrideErrors...)
 
 	return result
 }

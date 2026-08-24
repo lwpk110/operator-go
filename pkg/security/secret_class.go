@@ -17,6 +17,9 @@ limitations under the License.
 package security
 
 import (
+	"strings"
+
+	commonsv1alpha1 "github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/constant"
 )
 
@@ -74,3 +77,58 @@ const (
 	ServiceScope        SecretScope = "service"
 	ListenerVolumeScope SecretScope = "listener-volume"
 )
+
+// ScopeString renders a commons CredentialsScope as the CSI scope annotation value the
+// secret-operator parses: comma-separated entries of "node", "pod", "service=<name>" and
+// "listener-volume=<name>". Named entries carry the key= prefix — bare service names are
+// skipped by the secret-operator's scope parser. Returns "" for a nil or empty scope (the
+// scope annotation should then be omitted).
+func ScopeString(scope *commonsv1alpha1.CredentialsScope) string {
+	if scope == nil {
+		return ""
+	}
+	entries := []string{}
+	if scope.Node {
+		entries = append(entries, string(NodeScope))
+	}
+	if scope.Pod {
+		entries = append(entries, string(PodScope))
+	}
+	// Entries come straight out of a CR, so a name may be empty or carry the annotation's own
+	// syntax. Both are dropped rather than rejected: this is user data reaching a reconcile loop,
+	// and the alternative is failing a whole cluster over one list item. See scopeNameUsable.
+	for _, svc := range scope.Services {
+		if !scopeNameUsable(svc) {
+			continue
+		}
+		entries = append(entries, string(ServiceScope)+"="+svc)
+	}
+	for _, lv := range scope.ListenerVolumes {
+		if !scopeNameUsable(lv) {
+			continue
+		}
+		entries = append(entries, string(ListenerVolumeScope)+"="+lv)
+	}
+	return strings.Join(entries, CommonDelimiter)
+}
+
+// scopeNameUsable reports whether name can be rendered into the scope annotation as itself.
+//
+// The annotation is one comma-delimited string of "key=value" entries, so a name containing the
+// delimiter or the separator does not escape — it ADDS scopes. "mysvc,node" renders
+// "service=mysvc,node", which the secret-operator parses as a service scope *and* a node scope:
+// the CR author silently receives a certificate covering the node's hostname and IP, and a
+// reviewer reading the CR sees nothing unusual. An empty name renders a bare "service=" the
+// secret-operator cannot resolve at all.
+//
+// Dropping is the safe direction of the two available here. Splicing grants a broader credential
+// than the CR requested, invisibly; dropping withholds a scope the CR requested, which surfaces
+// as the application rejecting the certificate — a visible failure with a cause the user can
+// find. The loud rejection lives at the CRD layer (see CredentialsScope), where the user is told
+// at `kubectl apply`; this guard covers what admission cannot: a CR stored before those markers
+// existed, and a scope built in Go.
+func scopeNameUsable(name string) bool {
+	return name != "" &&
+		!strings.Contains(name, CommonDelimiter) &&
+		!strings.Contains(name, "=")
+}

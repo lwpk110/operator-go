@@ -19,7 +19,9 @@ package sidecar
 import (
 	"context"
 	"fmt"
+	"path"
 
+	"github.com/zncdatadev/operator-go/pkg/constant"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,10 +32,19 @@ const (
 	JMXExporterSidecarName = "jmx-exporter"
 	// JMXExporterPort is the default JMX Exporter metrics port.
 	JMXExporterPort = 5556
+	// JMXExporterMetricsPath is the path jmx_prometheus_httpserver serves metrics on, and the
+	// target of the container's liveness probe.
+	JMXExporterMetricsPath = "/metrics"
 	// JMXExporterConfigVolumeName is the name of the config volume.
 	JMXExporterConfigVolumeName = "jmx-exporter-config"
-	// JMXExporterConfigMountPath is the mount path for config.
-	JMXExporterConfigMountPath = "/opt/jmx_exporter"
+	// JMXExporterJarPath is the in-image path of the jar the sidecar executes.
+	JMXExporterJarPath = "/opt/jmx_exporter/jmx_prometheus_httpserver.jar"
+	// JMXExporterConfigMountPath is the mount path for config. It must stay outside the
+	// directory holding JMXExporterJarPath: a ConfigMap volume replaces the whole directory it
+	// is mounted on, so overlaying the jar's directory would hide the jar from its own command.
+	JMXExporterConfigMountPath = constant.KubedoopConfigDirMount + JMXExporterSidecarName
+	// JMXExporterConfigFileName is the ConfigMap key holding the exporter configuration.
+	JMXExporterConfigFileName = "config.yaml"
 	// JMXExporterDefaultConfigMapName is the default ConfigMap name for JMX Exporter config.
 	JMXExporterDefaultConfigMapName = "jmx-exporter-config"
 )
@@ -122,9 +133,9 @@ func (p *JMXExporterSidecarProvider) Inject(podSpec *corev1.PodSpec, config *Sid
 		Command: []string{
 			"java",
 			"-jar",
-			"/opt/jmx_exporter/jmx_prometheus_httpserver.jar",
+			JMXExporterJarPath,
 			fmt.Sprintf("%d", port),
-			JMXExporterConfigMountPath + "/config.yaml",
+			path.Join(JMXExporterConfigMountPath, JMXExporterConfigFileName),
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
@@ -133,16 +144,30 @@ func (p *JMXExporterSidecarProvider) Inject(podSpec *corev1.PodSpec, config *Sid
 				ReadOnly:  true,
 			},
 		},
-		ReadinessProbe: &corev1.Probe{
+		// Liveness, not readiness. Kubernetes documents that for a sidecar container (an init
+		// container with restartPolicy Always) "if a readinessProbe is specified for this init
+		// container, its result will be used to determine the ready state of the Pod", so a
+		// readiness probe here would take the PRODUCT's own ports out of every Service the moment
+		// scraping broke — an outage caused by the monitoring. A liveness failure restarts only
+		// this container, which the product never notices.
+		//
+		// The timings are deliberately far more forgiving than a readiness probe's would be.
+		// Scraping /metrics makes the exporter connect into the JVM over JMX and collect, so the
+		// response time tracks the product's GC behaviour: a stop-the-world pause must not be
+		// read as a broken exporter. Only a sustained failure (~3 minutes) — the case actually
+		// worth recovering from, an exporter that has permanently lost its JMX connection —
+		// triggers a restart.
+		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
-					Path: "/metrics",
+					Path: JMXExporterMetricsPath,
 					Port: intstr.FromInt(int(port)),
 				},
 			},
-			InitialDelaySeconds: 10,
-			TimeoutSeconds:      5,
-			PeriodSeconds:       10,
+			InitialDelaySeconds: 30,
+			TimeoutSeconds:      10,
+			PeriodSeconds:       30,
+			FailureThreshold:    6,
 		},
 	}
 
@@ -151,10 +176,15 @@ func (p *JMXExporterSidecarProvider) Inject(podSpec *corev1.PodSpec, config *Sid
 		container.Resources = *config.Resources
 	}
 
-	// Apply security context if provided
+	// Hardened by default, replaced wholesale (not merged) by an explicit SidecarConfig value.
+	// ReadOnlyRootFilesystem is deliberately left unset: this container runs a JVM, which writes
+	// hsperfdata into /tmp on startup.
+	container.SecurityContext = DefaultSecurityContext()
 	if config.SecurityContext != nil {
 		container.SecurityContext = config.SecurityContext
 	}
+
+	ApplyProbes(container, config.Probes)
 
 	// Apply custom configuration
 	if len(config.EnvVars) > 0 {
@@ -165,8 +195,10 @@ func (p *JMXExporterSidecarProvider) Inject(podSpec *corev1.PodSpec, config *Sid
 		AddVolumeMounts(container, config.VolumeMounts)
 	}
 
-	// Add container to pod (idempotent — replace if exists)
-	AddOrReplaceContainer(podSpec, container)
+	// JMX Exporter is a long-running sidecar: inject it as a native sidecar (init container
+	// with restartPolicy: Always).
+	container.RestartPolicy = SidecarRestartPolicy()
+	AddOrReplaceInitContainer(podSpec, container)
 
 	// Add required volumes if not present
 	volumes := []corev1.Volume{
@@ -183,6 +215,10 @@ func (p *JMXExporterSidecarProvider) Inject(podSpec *corev1.PodSpec, config *Sid
 	}
 
 	AddVolumes(podSpec, volumes)
+
+	// Caller-supplied volumes back the caller-supplied VolumeMounts applied above; without them
+	// a config.VolumeMounts entry would reference a volume the pod does not declare.
+	AddVolumes(podSpec, config.Volumes)
 
 	return nil
 }

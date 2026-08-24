@@ -25,22 +25,21 @@ import (
 type ListenerClass string
 
 const (
-	// ListenerClassClusterInternal creates ClusterIP Service.
+	// ListenerClassClusterInternal exposes the workload inside the cluster only: a ClusterIP
+	// Service.
 	ListenerClassClusterInternal ListenerClass = "cluster-internal"
-	// ListenerClassExternalStable creates LoadBalancer with stable IPs.
+	// ListenerClassExternalStable exposes the workload at an address that does not change as pods
+	// move: a LoadBalancer Service.
 	ListenerClassExternalStable ListenerClass = "external-stable"
-	// ListenerClassExternalUnstable creates LoadBalancer with dynamic IPs.
+	// ListenerClassExternalUnstable exposes the workload outside the cluster at an address tied to
+	// whichever node the pod lands on: a NodePort Service. "Unstable" is precisely that — the
+	// address changes when the pod is rescheduled.
+	//
+	// This comment previously said "LoadBalancer with dynamic IPs", which is what the name is NOT:
+	// a LoadBalancer is the STABLE class. ServiceTypeFor is the executable form
+	// of the mapping, and two downstream operators had already drawn opposite conclusions from the
+	// old wording.
 	ListenerClassExternalUnstable ListenerClass = "external-unstable"
-)
-
-// ListenerScope defines the scope of listener volumes provisioned by listener-operator.
-type ListenerScope string
-
-const (
-	// ListenerScopeNode limits listener discovery to the node level.
-	ListenerScopeNode ListenerScope = "Node"
-	// ListenerScopeCluster enables listener discovery across the cluster.
-	ListenerScopeCluster ListenerScope = "Cluster"
 )
 
 // Listener constants for listener-operator CSI integration.
@@ -54,8 +53,6 @@ const (
 	CSIDriverName = ListenerAPIGroup
 	// ListenerClassAnnotation specifies the listener class for PVC templates.
 	ListenerClassAnnotation = listenerAPIGroupPrefix + "class"
-	// ListenerScopeAnnotation specifies the listener scope for PVC templates.
-	ListenerScopeAnnotation = listenerAPIGroupPrefix + "scope"
 	// AnnotationListenerName identifies the listener. Defaults to pod name if unset.
 	AnnotationListenerName = listenerAPIGroupPrefix + "listenerName"
 )

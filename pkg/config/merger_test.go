@@ -21,6 +21,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/config"
+	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 )
 
 var _ = Describe("ConfigMerger", func() {
@@ -186,6 +187,160 @@ var _ = Describe("ConfigMerger", func() {
 			result := merger.Merge(roleOverrides, groupOverrides)
 
 			Expect(result.ConfigFiles["config.yaml"]).To(HaveKeyWithValue("key", "group_value"))
+		})
+	})
+
+	Describe("Merge with layered overrides (variadic)", func() {
+		It("should apply layers in increasing precedence (product < role < group)", func() {
+			productConfig := &v1alpha1.OverridesSpec{
+				ConfigOverrides: map[string]map[string]string{
+					"config.properties": {
+						"shared":       "from-product",
+						"product-only": "p",
+					},
+				},
+			}
+			roleOverrides := &v1alpha1.OverridesSpec{
+				ConfigOverrides: map[string]map[string]string{
+					"config.properties": {
+						"shared":    "from-role",
+						"role-only": "r",
+					},
+				},
+			}
+			groupOverrides := &v1alpha1.OverridesSpec{
+				ConfigOverrides: map[string]map[string]string{
+					"config.properties": {
+						"shared": "from-group",
+					},
+				},
+			}
+
+			result := merger.Merge(productConfig, roleOverrides, groupOverrides)
+
+			cfg := result.ConfigFiles["config.properties"]
+			// Highest layer that sets the key wins.
+			Expect(cfg).To(HaveKeyWithValue("shared", "from-group"))
+			// Lower-layer keys not touched by higher layers survive.
+			Expect(cfg).To(HaveKeyWithValue("product-only", "p"))
+			Expect(cfg).To(HaveKeyWithValue("role-only", "r"))
+		})
+
+		It("should let a CRD override win over the product config layer for the same key", func() {
+			productConfig := &v1alpha1.OverridesSpec{
+				ConfigOverrides: map[string]map[string]string{
+					"config.properties": {"coordinator": "true"},
+				},
+				EnvOverrides: map[string]string{"HEAP": "1G"},
+			}
+			groupOverrides := &v1alpha1.OverridesSpec{
+				ConfigOverrides: map[string]map[string]string{
+					"config.properties": {"coordinator": "false"},
+				},
+				EnvOverrides: map[string]string{"HEAP": "8G"},
+			}
+
+			result := merger.Merge(productConfig, nil, groupOverrides)
+
+			Expect(result.ConfigFiles["config.properties"]).To(HaveKeyWithValue("coordinator", "false"))
+			Expect(result.EnvVars).To(HaveKeyWithValue("HEAP", "8G"))
+		})
+
+		It("should skip nil layers and tolerate an empty argument list", func() {
+			Expect(merger.Merge().ConfigFiles).To(BeEmpty())
+			Expect(merger.Merge(nil, nil, nil)).NotTo(BeNil())
+
+			productConfig := &v1alpha1.OverridesSpec{
+				EnvOverrides: map[string]string{"ONLY": "product"},
+			}
+			result := merger.Merge(nil, productConfig, nil)
+			Expect(result.EnvVars).To(HaveKeyWithValue("ONLY", "product"))
+		})
+
+		It("should append CLI args across three layers with Append strategy", func() {
+			merger.SliceMergeStrategy = config.MergeStrategyAppend
+			productConfig := &v1alpha1.OverridesSpec{CliOverrides: []string{"--product"}}
+			roleOverrides := &v1alpha1.OverridesSpec{CliOverrides: []string{"--role"}}
+			groupOverrides := &v1alpha1.OverridesSpec{CliOverrides: []string{"--group"}}
+
+			result := merger.Merge(productConfig, roleOverrides, groupOverrides)
+
+			Expect(result.CliArgs).To(Equal([]string{"--product", "--role", "--group"}))
+		})
+
+		It("should strategically merge pod overrides across layers", func() {
+			productConfig := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{
+					Raw: []byte(`{"spec":{"serviceAccountName":"product-sa","terminationGracePeriodSeconds":30}}`),
+				},
+			}
+			groupOverrides := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{
+					Raw: []byte(`{"spec":{"serviceAccountName":"group-sa"}}`),
+				},
+			}
+
+			result := merger.Merge(productConfig, nil, groupOverrides)
+
+			Expect(result.PodOverrides).NotTo(BeNil())
+			// Group layer overrides the product value for the same field.
+			Expect(result.PodOverrides.Spec.ServiceAccountName).To(Equal("group-sa"))
+			// Product-only field is preserved through the strategic merge.
+			Expect(result.PodOverrides.Spec.TerminationGracePeriodSeconds).NotTo(BeNil())
+			Expect(*result.PodOverrides.Spec.TerminationGracePeriodSeconds).To(Equal(int64(30)))
+		})
+
+		It("should treat a malformed pod override as absent (neither wins nor surfaces)", func() {
+			malformed := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{Raw: []byte(`{not valid json`)},
+			}
+
+			// Malformed as the only layer -> no PodOverrides surface downstream.
+			Expect(merger.Merge(malformed).PodOverrides).To(BeNil())
+
+			// Malformed higher layer must not override a valid lower layer.
+			valid := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{
+					Raw: []byte(`{"spec":{"serviceAccountName":"valid-sa"}}`),
+				},
+			}
+			result := merger.Merge(valid, malformed)
+			Expect(result.PodOverrides).NotTo(BeNil())
+			Expect(result.PodOverrides.Spec.ServiceAccountName).To(Equal("valid-sa"))
+		})
+
+		// Dropping a layer the user wrote is not something the caller can infer from the merged
+		// result, so the failure has to be reported alongside it.
+		It("should record a dropped pod override layer instead of failing silently", func() {
+			malformed := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{Raw: []byte(`{not valid json`)},
+			}
+
+			result := merger.Merge(malformed)
+			Expect(result.PodOverrideErrors).To(HaveLen(1))
+			Expect(result.PodOverrideErrors[0].Error()).To(ContainSubstring("podOverrides layer is not a valid PodTemplateSpec"))
+		})
+
+		It("should record a layer whose JSON does not describe a pod template", func() {
+			// Valid JSON, wrong shape: "spec" is a string where a PodSpec is expected.
+			wrongShape := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{Raw: []byte(`{"spec":"not-an-object"}`)},
+			}
+
+			result := merger.Merge(wrongShape)
+			Expect(result.PodOverrideErrors).To(HaveLen(1))
+			Expect(result.PodOverrides).To(BeNil())
+		})
+
+		It("should report no pod override errors for well-formed layers", func() {
+			valid := &v1alpha1.OverridesSpec{
+				PodOverrides: &k8sruntime.RawExtension{
+					Raw: []byte(`{"spec":{"serviceAccountName":"valid-sa"}}`),
+				},
+			}
+
+			result := merger.Merge(valid, valid)
+			Expect(result.PodOverrideErrors).To(BeEmpty())
 		})
 	})
 })

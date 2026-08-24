@@ -15,12 +15,43 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
+      # Single source of truth: derive the golangci-lint version from the Makefile
+      # (GOLANGCI_LINT_VERSION) so CI and `make lint` can never drift.
+      - name: Resolve golangci-lint version from Makefile
+        id: golangci
+        run: |
+          version="$(grep -oP 'GOLANGCI_LINT_VERSION\s*\?=\s*\K\S+' Makefile)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
       - name: Run linter
         uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ steps.golangci.outputs.version }}
+
+  # examples/trino-operator is a separate Go module with its own .golangci.yml and its own pinned
+  # golangci-lint version, and the job above lints the root module only — so the reference
+  # implementation downstream operators copy was never linted at all. Driven through the module's
+  # own Makefile so its pin stays the single source of truth (it currently differs from the root's,
+  # which is fine: they are independent modules).
+  examples-lint:
+    name: Go Lint (examples/trino-operator)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: examples/trino-operator/go.mod
+
+      - name: Run linter
+        run: |
+          make -C examples/trino-operator lint
 
   md-lint:
     name: Markdown Lint
@@ -30,7 +61,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Run markdownlint
-        uses: DavidAnson/markdownlint-cli2-action@v23
+        uses: DavidAnson/markdownlint-cli2-action@v24
         with:
           globs: |
             README.*.md

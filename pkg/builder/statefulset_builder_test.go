@@ -22,10 +22,12 @@ import (
 	"github.com/zncdatadev/operator-go/pkg/apis/commons/v1alpha1"
 	"github.com/zncdatadev/operator-go/pkg/builder"
 	"github.com/zncdatadev/operator-go/pkg/config"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 )
 
 var _ = Describe("StatefulSetBuilder", func() {
@@ -169,14 +171,14 @@ var _ = Describe("StatefulSetBuilder", func() {
 		})
 	})
 
-	Describe("AddEnvVar", func() {
+	Describe("WithBaseEnvVars", func() {
 		It("should add an environment variable", func() {
-			result := stsBuilder.AddEnvVar("KEY", "value")
+			result := stsBuilder.WithBaseEnvVars([]corev1.EnvVar{{Name: "KEY", Value: "value"}})
 
 			Expect(result).To(Equal(stsBuilder))
-			Expect(stsBuilder.EnvVars).To(HaveLen(1))
-			Expect(stsBuilder.EnvVars[0].Name).To(Equal("KEY"))
-			Expect(stsBuilder.EnvVars[0].Value).To(Equal("value"))
+			Expect(stsBuilder.BaseEnvVars).To(HaveLen(1))
+			Expect(stsBuilder.BaseEnvVars[0].Name).To(Equal("KEY"))
+			Expect(stsBuilder.BaseEnvVars[0].Value).To(Equal("value"))
 		})
 	})
 
@@ -186,6 +188,23 @@ var _ = Describe("StatefulSetBuilder", func() {
 
 			Expect(result).To(Equal(stsBuilder))
 			Expect(stsBuilder.ServiceAccountName).To(Equal("my-sa"))
+		})
+	})
+
+	Describe("WithImagePullSecretName", func() {
+		It("puts the named Secret on the pod's imagePullSecrets", func() {
+			sts := stsBuilder.WithImagePullSecretName("registry-creds").Build()
+
+			Expect(sts.Spec.Template.Spec.ImagePullSecrets).To(Equal(
+				[]corev1.LocalObjectReference{{Name: "registry-creds"}}))
+		})
+
+		It("leaves the field unset for an empty name", func() {
+			// Writing an entry with an empty reference would make the kubelet look one up and warn
+			// on every pod — and every cluster that needs no registry credential is this case.
+			sts := stsBuilder.WithImagePullSecretName("").Build()
+
+			Expect(sts.Spec.Template.Spec.ImagePullSecrets).To(BeNil())
 		})
 	})
 
@@ -254,14 +273,51 @@ var _ = Describe("StatefulSetBuilder", func() {
 			Expect(sts.Spec.Template.Labels).To(Equal(labels))
 		})
 
-		It("should create liveness and readiness probes when ports are defined", func() {
+		It("generates a readiness probe from the ports, but never a liveness probe", func() {
+			// A liveness probe kills the container, and the builder cannot know which of a
+			// product's ports means "healthy" (the first declared one is just as likely to be a
+			// metrics port) nor how long the product takes to open it. Readiness stays: its worst
+			// case is a pod held out of its Services, which is visible and self-correcting, and
+			// dropping it would make every pod Ready the instant it starts — rolling a whole role
+			// group without waiting for any member to come up.
 			sts := stsBuilder.
 				AddPort("http", 8080, corev1.ProtocolTCP).
 				Build()
 
 			container := sts.Spec.Template.Spec.Containers[0]
-			Expect(container.LivenessProbe).NotTo(BeNil())
+			Expect(container.LivenessProbe).To(BeNil())
 			Expect(container.ReadinessProbe).NotTo(BeNil())
+			Expect(container.ReadinessProbe.TCPSocket.Port.IntValue()).To(Equal(8080))
+		})
+
+		It("targets the FIRST declared port, which is part of the contract", func() {
+			// Port order is not decoration: whatever a product declares first is what readiness
+			// watches. Declaring metrics first means the pod is called ready as soon as its
+			// exporter is up.
+			sts := stsBuilder.
+				AddPort("metrics", 9090, corev1.ProtocolTCP).
+				AddPort("rpc", 8020, corev1.ProtocolTCP).
+				Build()
+
+			container := sts.Spec.Template.Spec.Containers[0]
+			Expect(container.ReadinessProbe.TCPSocket.Port.IntValue()).To(Equal(9090))
+		})
+
+		It("reproduces the removed liveness probe on a port the product chooses", func() {
+			// The mechanism is kept, only the guess is gone: a product that wants exactly the old
+			// behavior asks for it in one line, naming the port itself.
+			sts := stsBuilder.
+				WithLivenessProbe(builder.DefaultTCPLivenessProbe(8020)).
+				AddPort("metrics", 9090, corev1.ProtocolTCP).
+				AddPort("rpc", 8020, corev1.ProtocolTCP).
+				Build()
+
+			lp := sts.Spec.Template.Spec.Containers[0].LivenessProbe
+			Expect(lp).NotTo(BeNil())
+			Expect(lp.TCPSocket.Port.IntValue()).To(Equal(8020), "the chosen port, not Ports[0]")
+			Expect(lp.InitialDelaySeconds).To(Equal(int32(30)))
+			Expect(lp.PeriodSeconds).To(Equal(int32(30)))
+			Expect(lp.FailureThreshold).To(Equal(int32(3)))
 		})
 
 		It("should not create probes when no ports are defined", func() {
@@ -319,8 +375,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 				Expect(container.ReadinessProbe).NotTo(BeNil())
 				Expect(container.ReadinessProbe.Exec).NotTo(BeNil())
 				Expect(container.ReadinessProbe.Exec.Command).To(Equal([]string{"cat", "/tmp/healthy"}))
-				Expect(container.LivenessProbe).NotTo(BeNil())
-				Expect(container.LivenessProbe.TCPSocket).NotTo(BeNil())
+				Expect(container.LivenessProbe).To(BeNil(), "liveness is never generated")
 			})
 
 			It("should set startup probe when configured", func() {
@@ -345,7 +400,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 				Expect(container.StartupProbe).NotTo(BeNil())
 				Expect(container.StartupProbe.HTTPGet.Path).To(Equal("/started"))
 				Expect(container.StartupProbe.FailureThreshold).To(Equal(int32(30)))
-				Expect(container.LivenessProbe).NotTo(BeNil())
+				Expect(container.LivenessProbe).To(BeNil(), "liveness is never generated")
 				Expect(container.ReadinessProbe).NotTo(BeNil())
 			})
 
@@ -377,7 +432,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 
 				container := sts.Spec.Template.Spec.Containers[0]
 				Expect(container.ReadinessProbe).To(BeNil())
-				Expect(container.LivenessProbe).NotTo(BeNil())
+				Expect(container.LivenessProbe).To(BeNil(), "liveness is never generated")
 			})
 
 			It("should disable all probes", func() {
@@ -432,16 +487,13 @@ var _ = Describe("StatefulSetBuilder", func() {
 				Expect(container.LivenessProbe.HTTPGet).NotTo(BeNil())
 			})
 
-			It("should use default TCP probe timing when no probe setter is called", func() {
+			It("should use default TCP readiness timing when no probe setter is called", func() {
 				sts := stsBuilder.
 					AddPort("http", 8080, corev1.ProtocolTCP).
 					Build()
 
 				container := sts.Spec.Template.Spec.Containers[0]
-				Expect(container.LivenessProbe.TCPSocket).NotTo(BeNil())
-				Expect(container.LivenessProbe.InitialDelaySeconds).To(Equal(int32(30)))
-				Expect(container.LivenessProbe.TimeoutSeconds).To(Equal(int32(10)))
-				Expect(container.LivenessProbe.PeriodSeconds).To(Equal(int32(30)))
+				Expect(container.LivenessProbe).To(BeNil(), "liveness is never generated")
 				Expect(container.ReadinessProbe.TCPSocket).NotTo(BeNil())
 				Expect(container.ReadinessProbe.InitialDelaySeconds).To(Equal(int32(10)))
 				Expect(container.ReadinessProbe.TimeoutSeconds).To(Equal(int32(5)))
@@ -479,11 +531,11 @@ var _ = Describe("StatefulSetBuilder", func() {
 			memLimit := resource.MustParse("512Mi")
 			resourcesSpec := &v1alpha1.ResourcesSpec{
 				CPU: &v1alpha1.CPUResource{
-					Max: maxCPU,
-					Min: minCPU,
+					Max: &maxCPU,
+					Min: &minCPU,
 				},
 				Memory: &v1alpha1.MemoryResource{
-					Limit: memLimit,
+					Limit: &memLimit,
 				},
 			}
 			result := stsBuilder.WithResources(resourcesSpec)
@@ -507,7 +559,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 			maxCPU := resource.MustParse("500m")
 			resourcesSpec := &v1alpha1.ResourcesSpec{
 				CPU: &v1alpha1.CPUResource{
-					Max: maxCPU,
+					Max: &maxCPU,
 				},
 			}
 			stsBuilder.WithResources(resourcesSpec)
@@ -522,11 +574,11 @@ var _ = Describe("StatefulSetBuilder", func() {
 			memLimit := resource.MustParse("512Mi")
 			resourcesSpec := &v1alpha1.ResourcesSpec{
 				CPU: &v1alpha1.CPUResource{
-					Max: maxCPU,
-					Min: minCPU,
+					Max: &maxCPU,
+					Min: &minCPU,
 				},
 				Memory: &v1alpha1.MemoryResource{
-					Limit: memLimit,
+					Limit: &memLimit,
 				},
 			}
 			sts := stsBuilder.
@@ -732,12 +784,306 @@ var _ = Describe("StatefulSetBuilder", func() {
 		})
 	})
 
+	Describe("PodOverrides container-level fidelity", func() {
+		It("should merge container resources into the main container by name", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: name,
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("2"),
+									corev1.ResourceMemory: resource.MustParse("2Gi"),
+								},
+							},
+						},
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+			main := sts.Spec.Template.Spec.Containers[0]
+			Expect(main.Image).To(Equal(image), "merging resources must not clobber the built container")
+			Expect(main.Resources.Limits.Cpu().String()).To(Equal("2"))
+			Expect(main.Resources.Limits.Memory().String()).To(Equal("2Gi"))
+		})
+
+		It("should merge container env by name, overriding built values and adding new ones", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: name,
+							Env: []corev1.EnvVar{
+								{Name: "COMMON_VAR", Value: "override-value"},
+								{Name: "EXTRA_VAR", Value: "extra-value"},
+							},
+						},
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithBaseEnvVars([]corev1.EnvVar{{Name: "COMMON_VAR", Value: "built-value"}}).
+				WithPodOverrides(overrides).
+				Build()
+
+			envByName := map[string]string{}
+			for _, e := range sts.Spec.Template.Spec.Containers[0].Env {
+				envByName[e.Name] = e.Value
+			}
+			Expect(envByName).To(HaveKeyWithValue("COMMON_VAR", "override-value"))
+			Expect(envByName).To(HaveKeyWithValue("EXTRA_VAR", "extra-value"))
+		})
+
+		It("should append override-only containers as additional pod containers", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "extra-sidecar", Image: "sidecar:1.0"},
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithPodOverrides(overrides).
+				Build()
+
+			names := make([]string, 0, len(sts.Spec.Template.Spec.Containers))
+			for _, c := range sts.Spec.Template.Spec.Containers {
+				names = append(names, c.Name)
+			}
+			Expect(names).To(ConsistOf(name, "extra-sidecar"))
+		})
+
+		It("should treat an unnamed override container as the main container (back-compat)", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							SecurityContext: &corev1.SecurityContext{
+								RunAsUser: ptr.To(int64(1234)),
+							},
+						},
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+			sc := sts.Spec.Template.Spec.Containers[0].SecurityContext
+			Expect(sc).NotTo(BeNil())
+			Expect(*sc.RunAsUser).To(Equal(int64(1234)))
+		})
+
+		It("should deep-merge the pod security context instead of replacing it", func() {
+			built := &corev1.PodSecurityContext{
+				RunAsUser: ptr.To(int64(1000)),
+				FSGroup:   ptr.To(int64(1000)),
+			}
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsUser: ptr.To(int64(0)),
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithSecurityContext(nil, built).
+				WithPodOverrides(overrides).
+				Build()
+
+			sc := sts.Spec.Template.Spec.SecurityContext
+			Expect(sc).NotTo(BeNil())
+			Expect(*sc.RunAsUser).To(Equal(int64(0)), "the overridden field wins")
+			Expect(sc.FSGroup).NotTo(BeNil(), "fields the override omits keep the built values")
+			Expect(*sc.FSGroup).To(Equal(int64(1000)))
+		})
+
+		It("should re-assert selector labels the override tries to change", func() {
+			overrides := &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app": "hijacked"},
+				},
+			}
+			sts := stsBuilder.
+				WithSelectorLabels(map[string]string{"app": "test"}).
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Selector.MatchLabels).To(HaveKeyWithValue("app", "test"))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("app", "test"),
+				"pod template must keep matching the immutable selector")
+		})
+
+		It("should keep the built containers when the override sets no containers", func() {
+			// Regression: PodSpec.Containers has no omitempty, so a nil slice marshals as
+			// "containers": null — a strategic-merge DELETE directive. An annotations-only or
+			// grace-period-only override must not wipe the pod's containers.
+			grace := int64(120)
+			overrides := &corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{"custom": "annotation"},
+				},
+				Spec: corev1.PodSpec{
+					TerminationGracePeriodSeconds: &grace,
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(image))
+			Expect(sts.Spec.Template.Annotations).To(HaveKeyWithValue("custom", "annotation"))
+			Expect(*sts.Spec.Template.Spec.TerminationGracePeriodSeconds).To(Equal(grace))
+		})
+
+		It("should merge overrides addressing the main container by its significant name", func() {
+			// Regression: with WithMainContainerName("node"), an override container named
+			// "node" must merge into the primary container — not append a phantom,
+			// image-less second container (the merge runs inside Build(), so the primary
+			// container must already carry its final name).
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: "node",
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU: resource.MustParse("2"),
+								},
+							},
+						},
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithMainContainerName("node").
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+			main := sts.Spec.Template.Spec.Containers[0]
+			Expect(main.Name).To(Equal("node"))
+			Expect(main.Image).To(Equal(image), "the merged container keeps the built image")
+			Expect(main.Resources.Limits.Cpu().String()).To(Equal("2"))
+		})
+
+		It("should merge container volumeMounts and pod volumes", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name: name,
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "extra-vol", MountPath: "/extra"},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{Name: "extra-vol", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+					},
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				AddVolumeMount(corev1.VolumeMount{Name: "built-vol", MountPath: "/built"}).
+				AddVolume(corev1.Volume{Name: "built-vol", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}).
+				WithPodOverrides(overrides).
+				Build()
+
+			mountPaths := make([]string, 0, len(sts.Spec.Template.Spec.Containers[0].VolumeMounts))
+			for _, m := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
+				mountPaths = append(mountPaths, m.MountPath)
+			}
+			Expect(mountPaths).To(ConsistOf("/built", "/extra"))
+
+			volNames := make([]string, 0, len(sts.Spec.Template.Spec.Volumes))
+			for _, v := range sts.Spec.Template.Spec.Volumes {
+				volNames = append(volNames, v.Name)
+			}
+			Expect(volNames).To(ConsistOf("built-vol", "extra-vol"))
+		})
+	})
+
+	Describe("WithEnableServiceLinks", func() {
+		It("should leave EnableServiceLinks unset by default (backward compatible)", func() {
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.EnableServiceLinks).To(BeNil())
+		})
+
+		It("should set the field on the builder", func() {
+			result := stsBuilder.WithEnableServiceLinks(false)
+
+			Expect(result).To(Equal(stsBuilder))
+			Expect(stsBuilder.EnableServiceLinks).NotTo(BeNil())
+			Expect(*stsBuilder.EnableServiceLinks).To(BeFalse())
+		})
+
+		It("should build a StatefulSet with EnableServiceLinks=false when configured", func() {
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithEnableServiceLinks(false).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.EnableServiceLinks).NotTo(BeNil())
+			Expect(*sts.Spec.Template.Spec.EnableServiceLinks).To(BeFalse())
+		})
+
+		It("should let a PodOverride override the default to true", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					EnableServiceLinks: boolPtr(true),
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithEnableServiceLinks(false).
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.EnableServiceLinks).NotTo(BeNil())
+			Expect(*sts.Spec.Template.Spec.EnableServiceLinks).To(BeTrue())
+		})
+
+		It("should keep the builder default when PodOverrides does not set EnableServiceLinks", func() {
+			overrides := &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					PriorityClassName: "high-priority",
+				},
+			}
+			sts := stsBuilder.
+				WithImage(image, corev1.PullIfNotPresent).
+				WithEnableServiceLinks(false).
+				WithPodOverrides(overrides).
+				Build()
+
+			Expect(sts.Spec.Template.Spec.EnableServiceLinks).NotTo(BeNil())
+			Expect(*sts.Spec.Template.Spec.EnableServiceLinks).To(BeFalse())
+		})
+	})
+
 	Describe("WithStorage", func() {
 		It("should set storage configuration", func() {
 			capacity := resource.MustParse("10Gi")
 			storage := &v1alpha1.StorageResource{
-				Capacity:     capacity,
-				StorageClass: "fast-ssd",
+				Capacity:     &capacity,
+				StorageClass: ptr.To("fast-ssd"),
 			}
 			mountPath := "/data"
 			result := stsBuilder.WithStorage(storage, mountPath)
@@ -758,8 +1104,8 @@ var _ = Describe("StatefulSetBuilder", func() {
 		It("should build StatefulSet with volume claim templates", func() {
 			capacity := resource.MustParse("10Gi")
 			storage := &v1alpha1.StorageResource{
-				Capacity:     capacity,
-				StorageClass: "fast-ssd",
+				Capacity:     &capacity,
+				StorageClass: ptr.To("fast-ssd"),
 			}
 			sts := stsBuilder.
 				WithImage(image, corev1.PullIfNotPresent).
@@ -775,7 +1121,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 		It("should add volume mount for storage", func() {
 			capacity := resource.MustParse("10Gi")
 			storage := &v1alpha1.StorageResource{
-				Capacity: capacity,
+				Capacity: &capacity,
 			}
 			sts := stsBuilder.
 				WithImage(image, corev1.PullIfNotPresent).
@@ -791,7 +1137,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 		It("should not set storage class if empty", func() {
 			capacity := resource.MustParse("10Gi")
 			storage := &v1alpha1.StorageResource{
-				Capacity: capacity,
+				Capacity: &capacity,
 			}
 			sts := stsBuilder.
 				WithImage(image, corev1.PullIfNotPresent).
@@ -857,7 +1203,7 @@ var _ = Describe("StatefulSetBuilder", func() {
 			sts := stsBuilder.
 				WithImage(image, corev1.PullIfNotPresent).
 				WithConfig(cfg).
-				AddEnvVar("OVERRIDE_KEY", "override-value").
+				WithBaseEnvVars([]corev1.EnvVar{{Name: "OVERRIDE_KEY", Value: "override-value"}}).
 				Build()
 
 			container := sts.Spec.Template.Spec.Containers[0]
@@ -865,6 +1211,33 @@ var _ = Describe("StatefulSetBuilder", func() {
 				HaveField("Name", "CONFIG_KEY"),
 				HaveField("Name", "OVERRIDE_KEY"),
 			))
+		})
+
+		It("emits config env vars in a deterministic (sorted) order across builds", func() {
+			// EnvVars is a map; without sorting, Go's randomized map iteration would produce a
+			// different container.Env ordering each Build(), making the rendered StatefulSet
+			// differ every reconcile and causing an endless CreateOrUpdate loop.
+			cfg := &config.MergedConfig{
+				EnvVars: map[string]string{"DDD": "4", "AAA": "1", "CCC": "3", "BBB": "2", "EEE": "5"},
+			}
+			build := func() []string {
+				sts := builder.NewStatefulSetBuilder(name, namespace).
+					WithImage(image, corev1.PullIfNotPresent).
+					WithConfig(cfg).Build()
+				env := sts.Spec.Template.Spec.Containers[0].Env
+				names := make([]string, 0, len(env))
+				for _, e := range env {
+					names = append(names, e.Name)
+				}
+				return names
+			}
+			first := build()
+			// The five config keys appear in sorted order.
+			Expect(first).To(Equal([]string{"AAA", "BBB", "CCC", "DDD", "EEE"}))
+			// Repeated builds are byte-for-byte identical (no churn).
+			for i := 0; i < 20; i++ {
+				Expect(build()).To(Equal(first))
+			}
 		})
 
 		It("should include CLI args from merged config", func() {
@@ -917,3 +1290,578 @@ var _ = Describe("StatefulSetBuilder", func() {
 func boolPtr(b bool) *bool {
 	return &b
 }
+
+var _ = Describe("StatefulSetBuilder Build isolation", func() {
+	const (
+		name      = "isolation-sts"
+		namespace = "test-namespace"
+	)
+
+	newBuilder := func() *builder.StatefulSetBuilder {
+		return builder.NewStatefulSetBuilder(name, namespace).
+			WithImage("img:1", corev1.PullIfNotPresent).
+			WithLabels(map[string]string{"app": "test"}).
+			WithSelectorLabels(map[string]string{"app.kubernetes.io/instance": "test"}).
+			WithAnnotations(map[string]string{"note": "test"}).
+			WithPorts([]corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}).
+			AddVolume(corev1.Volume{Name: "config"}).
+			AddVolumeMount(corev1.VolumeMount{Name: "config", MountPath: "/etc/config"}).
+			WithBaseEnvVars([]corev1.EnvVar{{Name: "KEY", Value: "value"}})
+	}
+
+	It("does not let a pod template mutation reach ObjectMeta or the selector", func() {
+		// The reconciler mutates the built pod template (sidecar injection), and .spec.selector is
+		// immutable once the StatefulSet exists.
+		sts := newBuilder().Build()
+
+		sts.Spec.Template.Labels["injected"] = "true"
+
+		Expect(sts.Labels).NotTo(HaveKey("injected"))
+		Expect(sts.Spec.Selector.MatchLabels).NotTo(HaveKey("injected"))
+	})
+
+	It("does not let a mutation of the built object reach a second Build", func() {
+		b := newBuilder()
+		first := b.Build()
+
+		first.Labels["extra"] = "true"
+		first.Spec.Template.Annotations["extra"] = "true"
+		first.Spec.Template.Spec.Volumes[0].Name = "renamed"
+		first.Spec.Template.Spec.Volumes = append(first.Spec.Template.Spec.Volumes,
+			corev1.Volume{Name: "sidecar-volume"})
+		first.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort = 9999
+		first.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath = "/elsewhere"
+		first.Spec.Template.Spec.Containers[0].Env[0].Value = "mutated"
+		*first.Spec.Replicas = 42
+
+		second := b.Build()
+
+		Expect(second.Labels).NotTo(HaveKey("extra"))
+		Expect(second.Spec.Template.Annotations).NotTo(HaveKey("extra"))
+		Expect(second.Spec.Template.Spec.Volumes).To(HaveLen(1))
+		Expect(second.Spec.Template.Spec.Volumes[0].Name).To(Equal("config"))
+		Expect(second.Spec.Template.Spec.Containers[0].Ports[0].ContainerPort).To(Equal(int32(8080)))
+		Expect(second.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/etc/config"))
+		Expect(second.Spec.Template.Spec.Containers[0].Env[0].Value).To(Equal("value"))
+		Expect(*second.Spec.Replicas).To(Equal(int32(1)))
+	})
+
+	It("does not append into the caller's port slice", func() {
+		ports := make([]corev1.ContainerPort, 1, 4)
+		ports[0] = corev1.ContainerPort{Name: "http", ContainerPort: 8080}
+
+		builder.NewStatefulSetBuilder(name, namespace).
+			WithPorts(ports).
+			AddPort("metrics", 9090, corev1.ProtocolTCP)
+
+		Expect(ports[:cap(ports)]).To(HaveLen(4))
+		Expect(ports[:cap(ports)][1].Name).To(BeEmpty())
+	})
+})
+
+var _ = Describe("StatefulSetBuilder pointer isolation", func() {
+	It("does not share pointer fields between the builder and the built object", func() {
+		// A handler keeps one builder-configured SecurityContext for the process lifetime and
+		// builds every role group from it; a per-role-group mutation of the built object (e.g.
+		// applying podOverrides) must not reach the next role group.
+		securityContext := &corev1.SecurityContext{RunAsUser: ptr.To(int64(1000))}
+		probe := &corev1.Probe{InitialDelaySeconds: 5}
+
+		b := builder.NewStatefulSetBuilder("test", "default").
+			WithImage("product:latest", corev1.PullIfNotPresent).
+			WithSecurityContext(securityContext, nil).
+			WithLivenessProbe(probe)
+
+		first := b.Build()
+		first.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser = ptr.To(int64(2000))
+		first.Spec.Template.Spec.Containers[0].LivenessProbe.InitialDelaySeconds = 99
+
+		Expect(*securityContext.RunAsUser).To(Equal(int64(1000)))
+		Expect(probe.InitialDelaySeconds).To(Equal(int32(5)))
+
+		second := b.Build()
+		Expect(*second.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser).To(Equal(int64(1000)))
+		Expect(second.Spec.Template.Spec.Containers[0].LivenessProbe.InitialDelaySeconds).To(Equal(int32(5)))
+	})
+
+	It("does not share the scalar pod spec pointers between two built objects", func() {
+		b := builder.NewStatefulSetBuilder("test", "default").
+			WithImage("product:latest", corev1.PullIfNotPresent).
+			WithTerminationGracePeriod(120).
+			WithEnableServiceLinks(false)
+
+		first := b.Build()
+		*first.Spec.Template.Spec.TerminationGracePeriodSeconds = 5
+		*first.Spec.Template.Spec.EnableServiceLinks = true
+
+		second := b.Build()
+		Expect(*second.Spec.Template.Spec.TerminationGracePeriodSeconds).To(Equal(int64(120)))
+		Expect(*second.Spec.Template.Spec.EnableServiceLinks).To(BeFalse())
+	})
+})
+
+// A strategic merge patch built from a typed PodTemplateSpec carries no $retainKeys directive, so
+// the members of Kubernetes' mutually exclusive structs deep-merge into each other. Every spec
+// here asserts that the override's member ends up as the ONLY one set — an object with two
+// members set is rejected by the API server, which fails the whole role group opaquely.
+var _ = Describe("StatefulSetBuilder podOverrides on mutually exclusive fields", func() {
+	const (
+		name      = "union-sts"
+		namespace = "test-namespace"
+		image     = "test-image:latest"
+	)
+
+	newBuilder := func() *builder.StatefulSetBuilder {
+		return builder.NewStatefulSetBuilder(name, namespace).
+			WithImage(image, corev1.PullIfNotPresent)
+	}
+
+	It("replaces a framework volume whose source type the override changes", func() {
+		overrides := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{
+					{Name: "config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+				},
+			},
+		}
+		sts := newBuilder().
+			AddVolume(corev1.Volume{Name: "config", VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "product-config"},
+				},
+			}}).
+			AddVolume(corev1.Volume{Name: "tls", VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{SecretName: "product-tls"},
+			}}).
+			WithPodOverrides(overrides).
+			Build()
+
+		volumes := sts.Spec.Template.Spec.Volumes
+		Expect(volumes).To(HaveLen(2))
+		Expect(volumes[0].Name).To(Equal("config"), "the replaced volume keeps its position")
+		Expect(volumes[0].EmptyDir).NotTo(BeNil())
+		Expect(volumes[0].ConfigMap).To(BeNil(), "the framework source must not survive next to the override's")
+		Expect(volumes[1].Secret).NotTo(BeNil(), "volumes the override does not name are untouched")
+	})
+
+	It("still merges field by field when the override keeps the source type", func() {
+		overrides := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{
+					{Name: "config", VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{DefaultMode: ptr.To(int32(0o400))},
+					}},
+				},
+			},
+		}
+		sts := newBuilder().
+			AddVolume(corev1.Volume{Name: "config", VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "product-config"},
+				},
+			}}).
+			WithPodOverrides(overrides).
+			Build()
+
+		cm := sts.Spec.Template.Spec.Volumes[0].ConfigMap
+		Expect(cm).NotTo(BeNil())
+		Expect(cm.Name).To(Equal("product-config"), "fields the override omits keep the built values")
+		Expect(*cm.DefaultMode).To(Equal(int32(0o400)))
+	})
+
+	It("keeps a framework volume the override does not name", func() {
+		overrides := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{
+					{Name: "extra", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+				},
+			},
+		}
+		sts := newBuilder().
+			AddVolume(corev1.Volume{Name: "config", VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "product-config"},
+				},
+			}}).
+			WithPodOverrides(overrides).
+			Build()
+
+		volumes := map[string]corev1.Volume{}
+		for _, v := range sts.Spec.Template.Spec.Volumes {
+			volumes[v.Name] = v
+		}
+		Expect(volumes).To(HaveLen(2))
+		Expect(volumes["config"].ConfigMap).NotTo(BeNil())
+		Expect(volumes["extra"].EmptyDir).NotTo(BeNil())
+	})
+
+	It("replaces the auto-generated probe handler the override changes", func() {
+		overrides := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: name,
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromInt(8080)},
+							},
+						},
+					},
+				},
+			},
+		}
+		sts := newBuilder().
+			AddPort("http", 8080, corev1.ProtocolTCP).
+			WithPodOverrides(overrides).
+			Build()
+
+		probe := sts.Spec.Template.Spec.Containers[0].ReadinessProbe
+		Expect(probe).NotTo(BeNil())
+		Expect(probe.HTTPGet).NotTo(BeNil())
+		Expect(probe.TCPSocket).To(BeNil(), "the auto-generated TCP handler must not survive next to the override's")
+		Expect(probe.PeriodSeconds).To(Equal(int32(10)), "timing fields the override omits still merge")
+	})
+
+	It("replaces a built env var value with the override's valueFrom", func() {
+		overrides := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: name,
+						Env: []corev1.EnvVar{
+							{Name: "PASSWORD", ValueFrom: &corev1.EnvVarSource{
+								SecretKeyRef: &corev1.SecretKeySelector{
+									LocalObjectReference: corev1.LocalObjectReference{Name: "creds"},
+									Key:                  "password",
+								},
+							}},
+						},
+					},
+				},
+			},
+		}
+		sts := newBuilder().
+			WithBaseEnvVars([]corev1.EnvVar{{Name: "PASSWORD", Value: "built-in-plaintext"}}).
+			WithPodOverrides(overrides).
+			Build()
+
+		env := sts.Spec.Template.Spec.Containers[0].Env
+		Expect(env).To(HaveLen(1))
+		Expect(env[0].ValueFrom).NotTo(BeNil())
+		Expect(env[0].Value).To(BeEmpty(), "value and valueFrom cannot both be set")
+	})
+
+	It("replaces a lifecycle handler the override changes", func() {
+		overrides := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{
+						Name: name,
+						Lifecycle: &corev1.Lifecycle{
+							PreStop: &corev1.LifecycleHandler{
+								HTTPGet: &corev1.HTTPGetAction{Path: "/shutdown", Port: intstr.FromInt(8080)},
+							},
+						},
+					},
+				},
+			},
+		}
+		sts := newBuilder().
+			WithPreStopHook([]string{"/bin/stop"}).
+			WithPodOverrides(overrides).
+			Build()
+
+		preStop := sts.Spec.Template.Spec.Containers[0].Lifecycle.PreStop
+		Expect(preStop).NotTo(BeNil())
+		Expect(preStop.HTTPGet).NotTo(BeNil())
+		Expect(preStop.Exec).To(BeNil(), "the built exec handler must not survive next to the override's")
+	})
+})
+
+var _ = Describe("StatefulSetBuilder podOverrides mount invariants", func() {
+	const frameworkPath = "/kubedoop/config"
+
+	// newBuilder mirrors what BaseRoleGroupHandler assembles before the override merge: the
+	// framework's config volume, mounted at the path the product reads its configuration from.
+	newBuilder := func() *builder.StatefulSetBuilder {
+		return builder.NewStatefulSetBuilder("mounts", "default").
+			WithMainContainerName("product").
+			WithImage("product:1", corev1.PullIfNotPresent).
+			AddVolume(corev1.Volume{
+				Name: "config",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: "mounts"},
+					},
+				},
+			}).
+			AddVolumeMount(corev1.VolumeMount{Name: "config", MountPath: frameworkPath})
+	}
+
+	It("reports an override that displaces the framework's mount while staying valid", func() {
+		// The dangerous shape, because NOTHING else catches it. Strategic merge keys volumeMounts
+		// by mountPath, so this does not add a mount — it rewrites the framework's entry to point
+		// at "extra". The override declares that volume too, so the pod spec is valid and the API
+		// server accepts it: the pods come up with the config ConfigMap mounted nowhere.
+		b := newBuilder().WithPodOverrides(&corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{
+					Name:         "extra",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+				Containers: []corev1.Container{{
+					Name:         "product",
+					VolumeMounts: []corev1.VolumeMount{{Name: "extra", MountPath: frameworkPath}},
+				}},
+			},
+		})
+
+		sts := b.Build()
+
+		// Reproduce the damage first, so the test documents what it is protecting against.
+		mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
+		Expect(mounts).To(HaveLen(1))
+		Expect(mounts[0].Name).To(Equal("extra"), "the framework's config mount is gone")
+
+		violations := b.PodOverrideViolations()
+		Expect(violations).To(HaveLen(1))
+		Expect(violations[0].Error()).To(ContainSubstring("displaced"))
+		Expect(violations[0].Error()).To(ContainSubstring(frameworkPath))
+		Expect(violations[0].Error()).To(ContainSubstring(`"config"`))
+		Expect(violations[0].Error()).To(ContainSubstring("podOverrides"))
+	})
+
+	It("reports an override whose mount references no volume", func() {
+		// The loud variant: the API server would reject this too, but its message names
+		// spec.template.spec.containers[0].volumeMounts[0].name — a field the user never wrote —
+		// and never mentions podOverrides.
+		b := newBuilder().WithPodOverrides(&corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{Containers: []corev1.Container{{
+				Name:         "product",
+				VolumeMounts: []corev1.VolumeMount{{Name: "undeclared", MountPath: frameworkPath}},
+			}}},
+		})
+
+		b.Build()
+
+		var joined string
+		for _, v := range b.PodOverrideViolations() {
+			joined += v.Error() + "\n"
+		}
+		Expect(joined).To(ContainSubstring("undeclared"))
+		Expect(joined).To(ContainSubstring("podOverrides"))
+	})
+
+	It("accepts an override that mounts at a path the framework does not own", func() {
+		// The case users actually mean, and the one that must keep working.
+		b := newBuilder().WithPodOverrides(&corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{
+					Name:         "extra",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+				Containers: []corev1.Container{{
+					Name:         "product",
+					VolumeMounts: []corev1.VolumeMount{{Name: "extra", MountPath: "/kubedoop/extra"}},
+				}},
+			},
+		})
+
+		sts := b.Build()
+
+		Expect(b.PodOverrideViolations()).To(BeEmpty())
+		Expect(sts.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(2))
+	})
+
+	It("does not mistake a volumeClaimTemplate for an undeclared volume", func() {
+		// A StatefulSet's volumeClaimTemplates are mountable by name and never appear in
+		// .spec.volumes — the framework's own data PVC among them.
+		b := newBuilder().
+			AddVolumeMount(corev1.VolumeMount{Name: "data", MountPath: "/kubedoop/data"}).
+			WithPodOverrides(&corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: "product",
+					Env:  []corev1.EnvVar{{Name: "EXTRA", Value: "1"}},
+				}}},
+			})
+		b.StorageConfig = &builder.StorageConfig{
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: "data"},
+			}},
+		}
+
+		b.Build()
+
+		Expect(b.PodOverrideViolations()).To(BeEmpty())
+	})
+
+	It("reports nothing when there is no override at all", func() {
+		b := newBuilder()
+		b.Build()
+		Expect(b.PodOverrideViolations()).To(BeEmpty())
+	})
+
+	It("describes the most recent build only, and hands back a copy", func() {
+		displacing := &corev1.PodTemplateSpec{
+			Spec: corev1.PodSpec{
+				Volumes: []corev1.Volume{{
+					Name:         "extra",
+					VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				}},
+				Containers: []corev1.Container{{
+					Name:         "product",
+					VolumeMounts: []corev1.VolumeMount{{Name: "extra", MountPath: frameworkPath}},
+				}},
+			},
+		}
+
+		b := newBuilder().WithPodOverrides(displacing)
+
+		// Building twice must not report the same violation twice.
+		b.Build()
+		b.Build()
+		Expect(b.PodOverrideViolations()).To(HaveLen(1))
+
+		// Mutating the returned slice must not reach the builder.
+		got := b.PodOverrideViolations()
+		got[0] = nil
+		Expect(b.PodOverrideViolations()[0]).To(HaveOccurred())
+
+		// Dropping the override and rebuilding must clear the previous build's findings.
+		b.PodOverrides = nil
+		b.Build()
+		Expect(b.PodOverrideViolations()).To(BeEmpty())
+	})
+})
+
+var _ = Describe("StatefulSet rollout knobs", func() {
+	// podManagementPolicy and updateStrategy are the two StatefulSetSpec fields that decide how a
+	// stateful role group starts and how it is upgraded. Neither is reachable through podOverrides
+	// — that is a PodTemplateSpec — so the builder has to expose them.
+	It("defaults podManagementPolicy to Parallel, which quorum products require", func() {
+		// OrderedReady starts pod N+1 only once pod N is Ready, and a ZooKeeper member or an HDFS
+		// JournalNode is not Ready until it sees a quorum that does not exist until its peers
+		// start: the role group would deadlock at pod-0. Parallel is a choice here, not an
+		// inherited default.
+		sts := builder.NewStatefulSetBuilder("sts", "ns").Build()
+		Expect(sts.Spec.PodManagementPolicy).To(Equal(appsv1.ParallelPodManagement))
+	})
+
+	It("lets a product with a strict start order ask for OrderedReady", func() {
+		sts := builder.NewStatefulSetBuilder("sts", "ns").
+			WithPodManagementPolicy(appsv1.OrderedReadyPodManagement).
+			Build()
+		Expect(sts.Spec.PodManagementPolicy).To(Equal(appsv1.OrderedReadyPodManagement))
+	})
+
+	It("leaves updateStrategy unset unless asked, and carries a partition when asked", func() {
+		// Unset means Kubernetes' own default (RollingUpdate, partition 0). A partition is how a
+		// canary upgrade is driven: raise it, roll the high ordinals, verify, lower it.
+		Expect(builder.NewStatefulSetBuilder("sts", "ns").Build().Spec.UpdateStrategy).
+			To(Equal(appsv1.StatefulSetUpdateStrategy{}))
+
+		sts := builder.NewStatefulSetBuilder("sts", "ns").
+			WithUpdateStrategy(appsv1.StatefulSetUpdateStrategy{
+				Type:          appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To(int32(2))},
+			}).Build()
+		Expect(sts.Spec.UpdateStrategy.Type).To(Equal(appsv1.RollingUpdateStatefulSetStrategyType))
+		Expect(*sts.Spec.UpdateStrategy.RollingUpdate.Partition).To(Equal(int32(2)))
+	})
+
+	It("does not share the update strategy with the builder", func() {
+		// Build() hands back nothing the caller can use to mutate the builder, or a second Build()
+		// would silently inherit the first caller's edits.
+		b := builder.NewStatefulSetBuilder("sts", "ns").
+			WithUpdateStrategy(appsv1.StatefulSetUpdateStrategy{
+				Type:          appsv1.RollingUpdateStatefulSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateStatefulSetStrategy{Partition: ptr.To(int32(2))},
+			})
+		first := b.Build()
+		*first.Spec.UpdateStrategy.RollingUpdate.Partition = 99
+
+		second := b.Build()
+		Expect(*second.Spec.UpdateStrategy.RollingUpdate.Partition).To(Equal(int32(2)))
+	})
+})
+
+var _ = Describe("storageClass distinguishes unset from empty", func() {
+	// Kubernetes reads `storageClassName: ""` as "no class at all — bind a pre-provisioned PV, do no
+	// dynamic provisioning", which is a different request from leaving the field out (use the
+	// cluster default). A plain string could not express the first, because "" was also how the
+	// role/role-group merge spelled "inherit".
+	build := func(class *string) *appsv1.StatefulSet {
+		return builder.NewStatefulSetBuilder("sts", "ns").
+			WithStorage(&v1alpha1.StorageResource{
+				Capacity:     ptr.To(resource.MustParse("1Gi")),
+				StorageClass: class,
+			}, "/data").
+			Build()
+	}
+
+	It("leaves storageClassName absent when the field is unset", func() {
+		Expect(build(nil).Spec.VolumeClaimTemplates[0].Spec.StorageClassName).To(BeNil())
+	})
+
+	It("writes an empty storageClassName when the user asked for one", func() {
+		Expect(build(ptr.To(""))).NotTo(BeNil())
+		Expect(build(ptr.To("")).Spec.VolumeClaimTemplates[0].Spec.StorageClassName).
+			To(HaveValue(Equal("")), "an explicit empty class is a request, not an omission")
+	})
+
+	It("writes the named class", func() {
+		Expect(build(ptr.To("fast-ssd")).Spec.VolumeClaimTemplates[0].Spec.StorageClassName).
+			To(HaveValue(Equal("fast-ssd")))
+	})
+})
+
+var _ = Describe("WithNamedStorage", func() {
+	// The custom-name path is the entire reason the name parameter exists — it is what
+	// RoleDeclaration.DataVolume{Name} reaches — and it had no coverage at all. The invariant that
+	// matters is that the claim template and the volumeMount carry the SAME name: if they drift,
+	// the pod references a volume that does not exist and the API server rejects the StatefulSet
+	// naming a field the user never wrote.
+	storage := func() *v1alpha1.StorageResource {
+		return &v1alpha1.StorageResource{
+			Capacity: ptr.To(resource.MustParse("10Gi")),
+		}
+	}
+
+	It("names the claim template and the mount identically", func() {
+		sts := builder.NewStatefulSetBuilder("test", "default").
+			WithImage("img:1", corev1.PullIfNotPresent).
+			WithNamedStorage("journal", storage(), "/kubedoop/journal").
+			Build()
+
+		Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(1))
+		Expect(sts.Spec.VolumeClaimTemplates[0].Name).To(Equal("journal"))
+
+		mounts := sts.Spec.Template.Spec.Containers[0].VolumeMounts
+		var found *corev1.VolumeMount
+		for i := range mounts {
+			if mounts[i].MountPath == "/kubedoop/journal" {
+				found = &mounts[i]
+			}
+		}
+		Expect(found).NotTo(BeNil(), "the declared mount path must be mounted")
+		Expect(found.Name).To(Equal("journal"),
+			"the mount must name the claim template, or the pod references a volume that does not exist")
+	})
+
+	It("falls back to the framework's default name when none is given", func() {
+		sts := builder.NewStatefulSetBuilder("test", "default").
+			WithImage("img:1", corev1.PullIfNotPresent).
+			WithNamedStorage("", storage(), "/kubedoop/data").
+			Build()
+		Expect(sts.Spec.VolumeClaimTemplates[0].Name).To(Equal(builder.DefaultDataVolumeName))
+	})
+
+	It("declines to build a claim when the role group states no storage", func() {
+		// A nil storage is a role group that said nothing, not one asking for a zero-sized volume.
+		sts := builder.NewStatefulSetBuilder("test", "default").
+			WithImage("img:1", corev1.PullIfNotPresent).
+			WithNamedStorage("data", nil, "/kubedoop/data").
+			Build()
+		Expect(sts.Spec.VolumeClaimTemplates).To(BeEmpty())
+	})
+})

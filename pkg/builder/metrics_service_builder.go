@@ -33,28 +33,41 @@ import (
 //   - Service labels: input labels + "prometheus.io/scrape=true"
 //   - Selector: input labels (without prometheus annotation)
 //
-// Override defaults with WithScheme() and WithPath().
+// Override defaults with WithScheme(), WithPath() and WithAnnotations().
+//
+// The name and the headless ClusterIP are deliberately NOT overridable. The reconciler addresses
+// the per-role-group metrics slot (RoleGroupResources.MetricsService) by the derived name on both
+// of its lifecycle paths — the in-spec reclaim when a handler stops shipping one, and the orphan
+// teardown when the role group leaves the spec — so a Service under any other name would be
+// applied and owner-referenced but reclaimed by neither. A product that genuinely needs a
+// differently named metrics Service ships it through RoleGroupResources.ExtraResources, whose
+// reclaim is label-based (see SetupWithManagerOptions.ExtraOwns).
 type MetricsServiceBuilder struct {
-	resourceName string
-	namespace    string
-	port         int32
-	portName     string
-	labels       map[string]string
-	scheme       string
-	path         string
+	resourceName   string
+	namespace      string
+	port           int32
+	portName       string
+	targetPortName string
+	labels         map[string]string
+	selector       map[string]string
+	annotations    map[string]string
+	scheme         string
+	path           string
 }
 
 // NewMetricsServiceBuilder creates a builder for a metrics headless service.
 // resourceName is the role group resource name; "-metrics" suffix is appended automatically.
 // port is the metrics port number.
 // labels are used for both service labels and selector.
+// The labels are copied, like every other builder's: a caller that keeps mutating the map it
+// passed must not change what this builder produces later.
 func NewMetricsServiceBuilder(resourceName, namespace string, port int32, labels map[string]string) *MetricsServiceBuilder {
 	return &MetricsServiceBuilder{
 		resourceName: resourceName,
 		namespace:    namespace,
 		port:         port,
 		portName:     "metrics",
-		labels:       labels,
+		labels:       maps.Clone(labels),
 		scheme:       "http",
 		path:         "", // empty = default /metrics
 	}
@@ -72,9 +85,41 @@ func (b *MetricsServiceBuilder) WithPath(path string) *MetricsServiceBuilder {
 	return b
 }
 
+// WithAnnotations merges extra annotations into the generated Prometheus set. Caller entries win
+// on key collisions, so any generated default can be restated or replaced; repeated calls
+// accumulate. The map is copied entry-wise, so a caller that keeps mutating the map it passed does
+// not change what this builder produces later.
+//
+// This is the channel for the scrape configuration the framework does not model — a
+// `prometheus.io/param_*` key, a product's own scrape hints, or a relabelling marker a downstream
+// ServiceMonitor keys off.
+func (b *MetricsServiceBuilder) WithAnnotations(annotations map[string]string) *MetricsServiceBuilder {
+	if b.annotations == nil {
+		b.annotations = make(map[string]string, len(annotations))
+	}
+	maps.Copy(b.annotations, annotations)
+	return b
+}
+
 // WithPortName sets the service port name (default: "metrics").
 func (b *MetricsServiceBuilder) WithPortName(name string) *MetricsServiceBuilder {
 	b.portName = name
+	return b
+}
+
+// WithTargetPortName targets the container port by name instead of by number.
+// By default the Service targets the numeric port; opting into a named
+// targetPort keeps the Service valid if the container port number changes,
+// as long as the container declares a port with the given name.
+func (b *MetricsServiceBuilder) WithTargetPortName(name string) *MetricsServiceBuilder {
+	b.targetPortName = name
+	return b
+}
+
+// WithSelector sets a dedicated pod selector (default: the labels). Use this to decouple the
+// selector from the descriptive labels. The map is copied.
+func (b *MetricsServiceBuilder) WithSelector(selector map[string]string) *MetricsServiceBuilder {
+	b.selector = maps.Clone(selector)
 	return b
 }
 
@@ -94,10 +139,21 @@ func (b *MetricsServiceBuilder) Build() *corev1.Service {
 	if b.path != "" {
 		annotations["prometheus.io/path"] = b.path
 	}
+	// Applied last so a caller entry wins over the generated default for the same key.
+	maps.Copy(annotations, b.annotations)
 
-	selector := maps.Clone(b.labels)
+	selectorSource := b.selector
+	if selectorSource == nil {
+		selectorSource = b.labels
+	}
+	selector := maps.Clone(selectorSource)
 	if selector == nil {
 		selector = map[string]string{}
+	}
+
+	targetPort := intstr.FromInt(int(b.port))
+	if b.targetPortName != "" {
+		targetPort = intstr.FromString(b.targetPortName)
 	}
 
 	return &corev1.Service{
@@ -114,7 +170,7 @@ func (b *MetricsServiceBuilder) Build() *corev1.Service {
 				{
 					Name:       b.portName,
 					Port:       b.port,
-					TargetPort: intstr.FromInt(int(b.port)),
+					TargetPort: targetPort,
 				},
 			},
 		},

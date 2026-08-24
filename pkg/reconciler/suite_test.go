@@ -57,15 +57,24 @@ var _ = BeforeSuite(func() {
 	Expect(v1alpha1.AddToScheme(testScheme)).To(Succeed())
 	// Add MockCluster to scheme for testing
 	Expect(testutil.AddToScheme(testScheme)).To(Succeed())
+	// AltMockCluster stands in for a second product's CR (see generic_reconciler_integration_test.go).
+	addAltMockClusterToScheme(testScheme)
 
 	By("bootstrapping test environment")
 	testEnv = testutil.NewTestEnv(nil)
+	// The env owns the scheme its client is built with, and the client has to know AltMockCluster
+	// to read one back; registering after Start would come too late.
+	addAltMockClusterToScheme(testEnv.Scheme)
 	Expect(testEnv.Start()).To(Succeed())
 
 	k8sClient = testEnv.GetClient()
 	Expect(k8sClient).NotTo(BeNil())
 
-	recorder = record.NewFakeRecorder(100)
+	// Large buffer: this recorder is shared across the whole suite and never drained, so a small
+	// buffer fills up (FakeRecorder blocks on a full channel) and hangs a reconcile mid-suite —
+	// which specs trigger it depends on Ginkgo's randomized order. Specs that assert on emitted
+	// events use their own drained recorder instead.
+	recorder = record.NewFakeRecorder(10000)
 	Expect(recorder).NotTo(BeNil())
 })
 

@@ -30,6 +30,9 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// defaultSecretStorageSize is the default PVC storage request for secret volumes.
+const defaultSecretStorageSize = "10Mi"
+
 // SecretVolumeRegistration declares a CSI secret volume need.
 // Created via convenience constructors (TLS, Kerberos) or Custom builder.
 type SecretVolumeRegistration struct {
@@ -58,7 +61,7 @@ func TLS(volumeName, secretClass string) *SecretVolumeRegistration {
 		format:      TLSP12,
 		scope:       string(PodScope) + CommonDelimiter + string(NodeScope),
 		password:    "changeit",
-		storageSize: "10Mi",
+		storageSize: defaultSecretStorageSize,
 	}
 }
 
@@ -69,7 +72,7 @@ func TLSPEMFormat(volumeName, secretClass string) *SecretVolumeRegistration {
 		secretClass: secretClass,
 		format:      TLSPEM,
 		scope:       string(PodScope) + CommonDelimiter + string(NodeScope),
-		storageSize: "10Mi",
+		storageSize: defaultSecretStorageSize,
 	}
 }
 
@@ -86,7 +89,7 @@ func KerberosVolume(volumeName, secretClass, serviceName string, additionalServi
 		secretClass:      secretClass,
 		format:           Kerberos,
 		scope:            string(PodScope) + CommonDelimiter + string(NodeScope),
-		storageSize:      "10Mi",
+		storageSize:      defaultSecretStorageSize,
 		kerberosSvcNames: svcNames,
 	}
 }
@@ -103,19 +106,25 @@ func ServiceTLS(volumeName, secretClass, serviceName string) *SecretVolumeRegist
 		format:      TLSP12,
 		scope:       string(PodScope) + CommonDelimiter + string(NodeScope) + CommonDelimiter + "service=" + serviceName,
 		password:    "changeit",
-		storageSize: "10Mi",
+		storageSize: defaultSecretStorageSize,
 	}
 }
 
-// ListenerVolume creates a secret volume registration with "listener-volume" scope.
-// This is used for listener-scoped secrets shared across service instances.
-func ListenerVolume(volumeName, secretClass string, format SecretFormat) *SecretVolumeRegistration {
+// ListenerVolume creates a secret volume registration with scope
+// "listener-volume=<listenerVolumeName>", used for secrets whose subject must cover the
+// addresses of a listener. listenerVolumeName is the name of the pod volume that mounts the
+// listener, which the secret-operator resolves to that listener's addresses; it is required,
+// as a bare "listener-volume" entry carries no name for the CSI driver to resolve.
+func ListenerVolume(volumeName, secretClass, listenerVolumeName string, format SecretFormat) *SecretVolumeRegistration {
+	if listenerVolumeName == "" {
+		panic("listenerVolumeName is required for listener volume scope")
+	}
 	return &SecretVolumeRegistration{
 		volumeName:  volumeName,
 		secretClass: secretClass,
 		format:      format,
-		scope:       string(ListenerVolumeScope),
-		storageSize: "10Mi",
+		scope:       string(ListenerVolumeScope) + "=" + listenerVolumeName,
+		storageSize: defaultSecretStorageSize,
 	}
 }
 
@@ -126,14 +135,58 @@ func Custom(volumeName, secretClass string, format SecretFormat) *SecretVolumeRe
 		secretClass: secretClass,
 		format:      format,
 		scope:       string(PodScope) + CommonDelimiter + string(NodeScope),
-		storageSize: "10Mi",
+		storageSize: defaultSecretStorageSize,
+	}
+}
+
+// CredentialsVolume creates a secret volume registration for plain credential secrets
+// (e.g. S3 or database access keys) that carry no format annotation — the secret-operator
+// serves the secret's keys as files verbatim. No scope is set by default (matching how
+// credential secrets are typically class-resolved); use WithScope, e.g. with ScopeString,
+// to add one.
+func CredentialsVolume(volumeName, secretClass string) *SecretVolumeRegistration {
+	return &SecretVolumeRegistration{
+		volumeName:  volumeName,
+		secretClass: secretClass,
+		storageSize: defaultSecretStorageSize,
 	}
 }
 
 // WithScope sets the CSI scope annotation value. Default is "pod,node".
+// Panics when an entry the secret-operator parses as "key=value" ("service",
+// "listener-volume") carries no value — see validateScope.
 func (r *SecretVolumeRegistration) WithScope(scope string) *SecretVolumeRegistration {
+	if err := validateScope(scope); err != nil {
+		panic(err.Error())
+	}
 	r.scope = scope
 	return r
+}
+
+// namedScopes are the scope keys the secret-operator parses as "key=<name>". A bare key, or
+// one with an empty name, leaves its scope parser without the value it unconditionally reads.
+var namedScopes = map[string]struct{}{
+	string(ServiceScope):        {},
+	string(ListenerVolumeScope): {},
+}
+
+// validateScope rejects scope annotation values the secret-operator cannot resolve: empty
+// entries, and named scopes without a name. Unknown keys pass — the scope vocabulary is owned
+// by the secret-operator and may grow ahead of this SDK.
+func validateScope(scope string) error {
+	if scope == "" {
+		return nil
+	}
+	for _, entry := range strings.Split(scope, CommonDelimiter) {
+		key, value, _ := strings.Cut(entry, "=")
+		if key == "" {
+			return fmt.Errorf("secret scope %q contains an empty entry", scope)
+		}
+		if _, named := namedScopes[key]; named && value == "" {
+			return fmt.Errorf("secret scope entry %q must be %s=<name>", entry, key)
+		}
+	}
+	return nil
 }
 
 // WithPassword sets the PKCS12 password. Default is "changeit" for TLS P12 format.
@@ -190,9 +243,16 @@ func (r *SecretVolumeRegistration) WithExtraAnnotation(key, value string) *Secre
 // buildAnnotations constructs the PVC template annotations for this registration.
 func (r *SecretVolumeRegistration) buildAnnotations() map[string]string {
 	annotations := map[string]string{
-		SecretClassAnnotation:      r.secretClass,
-		SecretClassScopeAnnotation: r.scope,
-		AnnotationSecretsFormat:    string(r.format),
+		SecretClassAnnotation: r.secretClass,
+	}
+
+	// Scope and format are omitted when empty (plain credential volumes have neither);
+	// every typed constructor sets both, so their annotations are unchanged.
+	if r.scope != "" {
+		annotations[SecretClassScopeAnnotation] = r.scope
+	}
+	if r.format != "" {
+		annotations[AnnotationSecretsFormat] = string(r.format)
 	}
 
 	// PKCS12 password is only applicable to PKCS12 format
@@ -273,23 +333,32 @@ func NewSecretProvisioner() *SecretProvisioner {
 	}
 }
 
-// WithMountBasePath overrides the default mount base path.
-// The path is normalized automatically while preserving the root path ("/").
+// WithMountBasePath overrides the default mount base path. An empty path leaves the default
+// (constant.KubedoopMountDir) in place, matching ListenerProvisioner.WithMountBasePath.
+// The path is normalized automatically while preserving the root path ("/"), and must be
+// absolute: a relative base would compose into a relative container mountPath, which the API
+// server rejects.
 func (p *SecretProvisioner) WithMountBasePath(basePath string) *SecretProvisioner {
 	if basePath == "" {
-		p.mountBasePath = ""
 		return p
+	}
+	if !path.IsAbs(basePath) {
+		panic(fmt.Sprintf("secret mount base path %q must be absolute", basePath))
 	}
 	p.mountBasePath = path.Clean(basePath)
 	return p
 }
 
 // Register adds secret volume declarations to the provisioner.
-// Panics if a volume with the same name is already registered.
+// Panics if a volume with the same name is already registered, or if a registration carries a
+// scope the secret-operator cannot resolve.
 func (p *SecretProvisioner) Register(registrations ...*SecretVolumeRegistration) *SecretProvisioner {
 	for _, reg := range registrations {
 		if _, exists := p.volumeNames[reg.volumeName]; exists {
 			panic(fmt.Sprintf("secret volume %q is already registered", reg.volumeName))
+		}
+		if err := validateScope(reg.scope); err != nil {
+			panic(fmt.Sprintf("secret volume %q: %v", reg.volumeName, err))
 		}
 		p.volumeNames[reg.volumeName] = struct{}{}
 		p.registrations = append(p.registrations, reg)

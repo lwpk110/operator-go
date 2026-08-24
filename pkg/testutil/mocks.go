@@ -27,17 +27,38 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
+// MockClusterStatus mirrors the shape a real product CR's status has: the SDK's generic status
+// embedded alongside product-owned fields. ClusterInterface only exposes the embedded part, so a
+// mock whose status IS the generic struct cannot observe whether the framework preserves the
+// product's own fields across a status write.
+//
+// The explicit generate marker is load-bearing: embedding GenericClusterStatus PROMOTES its
+// DeepCopyInto, so controller-gen concludes this type already implements the deep-copy contract
+// and silently emits nothing — leaving MockCluster.DeepCopyInto calling the promoted method with
+// the wrong receiver type, which does not compile.
+//
+// +kubebuilder:object:generate=true
+type MockClusterStatus struct {
+	v1alpha1.GenericClusterStatus `json:",inline"`
+
+	// ProductField stands in for a product-computed status field (e.g. a Trino cluster's
+	// CatalogsReady), typically written by an extension hook during reconciliation.
+	ProductField string `json:"productField,omitempty"`
+}
+
 // MockCluster is a test CR that embeds ObjectMeta for client.Object compatibility.
+//
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 type MockCluster struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
-	Spec              v1alpha1.GenericClusterSpec   `json:"spec,omitempty"`
-	Status            v1alpha1.GenericClusterStatus `json:"status,omitempty"`
+	Spec              v1alpha1.GenericClusterSpec `json:"spec,omitempty"`
+	Status            MockClusterStatus           `json:"status,omitempty"`
 }
 
 // NewMockCluster creates a new MockCluster with default values.
@@ -93,157 +114,71 @@ func (m *MockCluster) WithClusterOperation(op *v1alpha1.ClusterOperationSpec) *M
 	return m
 }
 
-// DeepCopy creates a deep copy of MockCluster.
-func (m *MockCluster) DeepCopy() *MockCluster {
-	if m == nil {
-		return nil
-	}
-	out := new(MockCluster)
-	*out = *m
-	out.TypeMeta = m.TypeMeta
-	out.ObjectMeta = *m.ObjectMeta.DeepCopy()
-	out.Spec = *m.Spec.DeepCopy()
-	out.Status = *m.Status.DeepCopy()
-	return out
-}
-
-// DeepCopyObject implements runtime.Object.
-func (m *MockCluster) DeepCopyObject() runtime.Object {
-	return m.DeepCopy()
-}
-
-// ClusterWrapper wraps MockCluster to implement common.ClusterInterface.
-// This is needed because common.ClusterInterface expects GetUID() string,
-// but client.Object expects GetUID() types.UID.
-type ClusterWrapper struct {
-	*MockCluster
-	scheme *runtime.Scheme
-}
-
-// WrapMockCluster wraps a MockCluster to implement common.ClusterInterface.
-// An optional scheme can be provided for tests that require scheme access.
-func WrapMockCluster(m *MockCluster, scheme ...*runtime.Scheme) *ClusterWrapper {
-	var s *runtime.Scheme
-	if len(scheme) > 0 {
-		s = scheme[0]
-	}
-	return &ClusterWrapper{MockCluster: m, scheme: s}
-}
-
-// GetObjectMeta implements common.ClusterInterface.
-func (w *ClusterWrapper) GetObjectMeta() *metav1.ObjectMeta {
-	return &w.ObjectMeta
-}
-
-// GetUID returns the UID for common.ClusterInterface compatibility.
-func (w *ClusterWrapper) GetUID() types.UID {
-	return w.UID
-}
-
-// GetName implements common.ClusterInterface.
-func (w *ClusterWrapper) GetName() string {
-	return w.Name
-}
-
-// GetNamespace implements common.ClusterInterface.
-func (w *ClusterWrapper) GetNamespace() string {
-	return w.Namespace
-}
-
-// GetLabels implements common.ClusterInterface.
-func (w *ClusterWrapper) GetLabels() map[string]string {
-	if w.Labels == nil {
-		return make(map[string]string)
-	}
-	return w.Labels
-}
-
-// GetAnnotations implements common.ClusterInterface.
-func (w *ClusterWrapper) GetAnnotations() map[string]string {
-	if w.Annotations == nil {
-		return make(map[string]string)
-	}
-	return w.Annotations
-}
-
 // GetSpec implements common.ClusterInterface.
-func (w *ClusterWrapper) GetSpec() *v1alpha1.GenericClusterSpec {
-	return &w.Spec
+func (m *MockCluster) GetSpec() *v1alpha1.GenericClusterSpec {
+	return &m.Spec
 }
 
-// GetStatus implements common.ClusterInterface.
-func (w *ClusterWrapper) GetStatus() *v1alpha1.GenericClusterStatus {
-	return &w.Status
+// GetStatus implements common.ClusterInterface. It hands out the embedded generic status, so a
+// framework write through the pointer leaves ProductField alone.
+func (m *MockCluster) GetStatus() *v1alpha1.GenericClusterStatus {
+	return &m.Status.GenericClusterStatus
 }
 
-// SetStatus implements common.ClusterInterface.
-func (w *ClusterWrapper) SetStatus(status *v1alpha1.GenericClusterStatus) {
-	w.Status = *status
-}
-
-// GetScheme implements common.ClusterInterface.
-// Returns the scheme if one was provided during wrapping, nil otherwise.
-func (w *ClusterWrapper) GetScheme() *runtime.Scheme {
-	return w.scheme
-}
-
-// DeepCopyCluster implements common.ClusterInterface.
-// Handles nil receiver to support generic reconciler's fetchCR pattern.
-func (w *ClusterWrapper) DeepCopyCluster() common.ClusterInterface {
-	if w == nil || w.MockCluster == nil {
-		// Return a new empty wrapper with properly initialized TypeMeta
-		// This is needed because fetchCR in generic_reconciler.go calls
-		// DeepCopyCluster() on a zero value to create an instance for client.Get
-		return &ClusterWrapper{
-			MockCluster: &MockCluster{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "MockCluster",
-					APIVersion: "test.zncdata.dev/v1alpha1",
-				},
-			},
-		}
-	}
-	return WrapMockCluster(w.DeepCopy())
-}
-
-// GetRuntimeObject implements common.ClusterInterface.
-func (w *ClusterWrapper) GetRuntimeObject() runtime.Object {
-	return w.MockCluster
-}
-
-// MockRoleGroupHandler is a test implementation of RoleGroupHandler.
-type MockRoleGroupHandler struct {
-	BuildResourcesFunc func(ctx context.Context, k8sClient client.Client, cr *ClusterWrapper, buildCtx *reconciler.RoleGroupBuildContext) (*reconciler.RoleGroupResources, error)
+// MockRoleGroupHandlerFor is a test implementation of reconciler.RoleGroupHandler for an
+// arbitrary product CR type, so a product can substitute it wherever its own
+// RoleGroupHandler[*MyCluster] is expected.
+type MockRoleGroupHandlerFor[CR common.ClusterInterface] struct {
+	BuildResourcesFunc func(ctx context.Context, k8sClient client.Client, cr CR, buildCtx *reconciler.RoleGroupBuildContext) (*reconciler.RoleGroupResources, error)
 	Image              string
 	ContainerPorts     map[string][]corev1.ContainerPort
 	ServicePorts       map[string][]corev1.ServicePort
 }
 
-// NewMockRoleGroupHandler creates a new MockRoleGroupHandler.
-func NewMockRoleGroupHandler() *MockRoleGroupHandler {
-	return &MockRoleGroupHandler{
+// MockRoleGroupHandler is the mock handler bound to the testutil CR.
+type MockRoleGroupHandler = MockRoleGroupHandlerFor[*MockCluster]
+
+// NewMockRoleGroupHandlerFor creates a new MockRoleGroupHandlerFor for a product CR type.
+func NewMockRoleGroupHandlerFor[CR common.ClusterInterface]() *MockRoleGroupHandlerFor[CR] {
+	return &MockRoleGroupHandlerFor[CR]{
 		Image:          "test-image:latest",
 		ContainerPorts: make(map[string][]corev1.ContainerPort),
 		ServicePorts:   make(map[string][]corev1.ServicePort),
 	}
 }
 
-// WithImage sets the image on the MockRoleGroupHandler.
-func (h *MockRoleGroupHandler) WithImage(image string) *MockRoleGroupHandler {
+// NewMockRoleGroupHandler creates a new MockRoleGroupHandler for the testutil CR.
+func NewMockRoleGroupHandler() *MockRoleGroupHandler {
+	return NewMockRoleGroupHandlerFor[*MockCluster]()
+}
+
+// WithImage sets the image on the mock handler.
+func (h *MockRoleGroupHandlerFor[CR]) WithImage(image string) *MockRoleGroupHandlerFor[CR] {
 	h.Image = image
 	return h
 }
 
 // WithBuildResourcesFunc sets the BuildResourcesFunc.
-func (h *MockRoleGroupHandler) WithBuildResourcesFunc(fn func(ctx context.Context, k8sClient client.Client, cr *ClusterWrapper, buildCtx *reconciler.RoleGroupBuildContext) (*reconciler.RoleGroupResources, error)) *MockRoleGroupHandler {
+func (h *MockRoleGroupHandlerFor[CR]) WithBuildResourcesFunc(fn func(ctx context.Context, k8sClient client.Client, cr CR, buildCtx *reconciler.RoleGroupBuildContext) (*reconciler.RoleGroupResources, error)) *MockRoleGroupHandlerFor[CR] {
 	h.BuildResourcesFunc = fn
 	return h
 }
 
 // BuildResources builds resources using the mock handler.
-func (h *MockRoleGroupHandler) BuildResources(ctx context.Context, k8sClient client.Client, cr *ClusterWrapper, buildCtx *reconciler.RoleGroupBuildContext) (*reconciler.RoleGroupResources, error) {
+func (h *MockRoleGroupHandlerFor[CR]) BuildResources(ctx context.Context, k8sClient client.Client, cr CR, buildCtx *reconciler.RoleGroupBuildContext) (*reconciler.RoleGroupResources, error) {
 	if h.BuildResourcesFunc != nil {
 		return h.BuildResourcesFunc(ctx, k8sClient, cr, buildCtx)
+	}
+
+	// Effective replica count, mirroring the real BaseRoleGroupHandler: the role group's declared
+	// replicas, but forced to 0 when the cluster is stopped (ClusterOperation.stopped). Stopping
+	// runs zero pods while all resources are still built/preserved, so the mock must produce the
+	// StatefulSet with replicas 0 rather than short-circuiting resource creation.
+	replicas := buildCtx.RoleGroupSpec.GetReplicas()
+	if buildCtx.ClusterSpec != nil &&
+		buildCtx.ClusterSpec.ClusterOperation != nil &&
+		buildCtx.ClusterSpec.ClusterOperation.Stopped {
+		replicas = int32(0)
 	}
 
 	// Return default resources
@@ -251,12 +186,16 @@ func (h *MockRoleGroupHandler) BuildResources(ctx context.Context, k8sClient cli
 		ConfigMap: NewTestConfigMap(buildCtx.ResourceName, buildCtx.ClusterNamespace),
 		Service:   NewTestService(buildCtx.ResourceName, buildCtx.ClusterNamespace),
 		StatefulSet: NewTestStatefulSetBuilder(buildCtx.ResourceName, buildCtx.ClusterNamespace).
+			WithReplicas(replicas).
 			WithImage(h.Image, corev1.PullIfNotPresent).
 			Build(),
 	}, nil
 }
 
-// MockExtension is a test implementation of ClusterExtension.
+// MockExtension records cluster-level extension hook invocations.
+// Its method set (ClusterPreReconcile/ClusterPostReconcile/ClusterOnError plus the Name
+// field) does not satisfy common.ClusterExtension, so it cannot be registered in an
+// ExtensionRegistry — drive its hooks directly.
 type MockExtension struct {
 	PreReconcileFunc  func(ctx context.Context, client client.Client, cr common.ClusterInterface) error
 	PostReconcileFunc func(ctx context.Context, client client.Client, cr common.ClusterInterface) error
@@ -338,7 +277,51 @@ func DefaultRoleGroupResources(name, namespace, image string) *reconciler.RoleGr
 }
 
 // Verify interface implementations
-var _ common.ClusterInterface = &ClusterWrapper{}
+var _ common.ClusterInterface = &MockCluster{}
+var _ common.ClusterResource[*MockCluster] = &MockCluster{}
+var _ reconciler.RoleGroupHandler[*MockCluster] = &MockRoleGroupHandler{}
+
+// AltMockCluster is a SECOND product's cluster resource, standing beside MockCluster so tests can
+// put two CR types side by side — a manager process hosting two products runs one
+// GenericReconciler per CR type, and the extension registry is generic over the CR, so per-CR-type
+// isolation is only provable with two of them.
+//
+// It is deliberately the minimum a product CR can be: TypeMeta and ObjectMeta for client.Object,
+// the deep copy controller-gen generates, and the two accessors that project spec and status.
+// Nothing here bridges the CR to the framework — the CR IS the object the framework reads, owns
+// resources with and writes status to. Unlike MockCluster its status is the bare
+// GenericClusterStatus, with no product-owned field.
+//
+// It lives here rather than in a _test.go file because controller-gen cannot generate a CRD
+// schema from an unexported type in a test file, and a schema-free CRD is precisely what this
+// package exists to stop shipping.
+//
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+type AltMockCluster struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              v1alpha1.GenericClusterSpec   `json:"spec,omitempty"`
+	Status            v1alpha1.GenericClusterStatus `json:"status,omitempty"`
+}
+
+// GetSpec implements common.ClusterInterface.
+func (c *AltMockCluster) GetSpec() *v1alpha1.GenericClusterSpec { return &c.Spec }
+
+// GetStatus implements common.ClusterInterface.
+func (c *AltMockCluster) GetStatus() *v1alpha1.GenericClusterStatus { return &c.Status }
+
+// AltMockClusterList is a list of AltMockCluster.
+//
+// +kubebuilder:object:root=true
+type AltMockClusterList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+	Items           []AltMockCluster `json:"items"`
+}
+
+var _ common.ClusterInterface = &AltMockCluster{}
+var _ common.ClusterResource[*AltMockCluster] = &AltMockCluster{}
 
 // SchemeBuilder for MockCluster
 var SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
@@ -347,7 +330,10 @@ var SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
 var AddToScheme = SchemeBuilder.AddToScheme
 
 func addKnownTypes(scheme *runtime.Scheme) error {
-	scheme.AddKnownTypes(MockClusterGroupVersion, &MockCluster{}, &MockClusterList{})
+	scheme.AddKnownTypes(MockClusterGroupVersion,
+		&MockCluster{}, &MockClusterList{},
+		&AltMockCluster{}, &AltMockClusterList{},
+	)
 	metav1.AddToGroupVersion(scheme, MockClusterGroupVersion)
 	return nil
 }
@@ -356,17 +342,10 @@ func addKnownTypes(scheme *runtime.Scheme) error {
 var MockClusterGroupVersion = schema.GroupVersion{Group: "test.zncdata.dev", Version: "v1alpha1"}
 
 // MockClusterList is a list of MockCluster
+//
+// +kubebuilder:object:root=true
 type MockClusterList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata"`
 	Items           []MockCluster `json:"items"`
-}
-
-// DeepCopyObject implements runtime.Object.
-func (l *MockClusterList) DeepCopyObject() runtime.Object {
-	return &MockClusterList{
-		TypeMeta: l.TypeMeta,
-		ListMeta: l.ListMeta,
-		Items:    append([]MockCluster{}, l.Items...),
-	}
 }
